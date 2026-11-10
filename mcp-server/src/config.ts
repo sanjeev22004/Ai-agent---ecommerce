@@ -4,9 +4,23 @@ import dotenv from "dotenv";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Load .env from project root (mcp-server/) and repo root
+// Load .env from project root and mcp-server root
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
+
+const rawProvider = (process.env.LLM_PROVIDER || "ollama").toLowerCase();
+const provider = (rawProvider === "grok" ? "groq" : rawProvider) as "ollama" | "groq" | "gemini";
+
+let defaultBaseUrl = "http://localhost:11434/v1";
+let defaultModel = "llama3.2";
+
+if (provider === "groq") {
+  defaultBaseUrl = "https://api.groq.com/openai/v1";
+  defaultModel = "openai/gpt-oss-120b";
+} else if (provider === "gemini") {
+  defaultBaseUrl = "https://generativelanguage.googleapis.com/v1beta/openai/";
+  defaultModel = "gemini-2.5-flash";
+}
 
 export const config = {
   // ─── Database ────────────────────────────────────────────────────────────
@@ -21,10 +35,10 @@ export const config = {
 
   // ─── LLM Provider ──────────────────────────────────────────────────────
   llm: {
-    provider: (process.env.LLM_PROVIDER || "ollama") as "ollama" | "groq",
-    model: process.env.LLM_MODEL || "llama3.2",
-    baseUrl: process.env.LLM_BASE_URL || "http://localhost:11434/v1",
-    apiKey: process.env.LLM_API_KEY || "ollama", // Ollama doesn't need a real key
+    provider,
+    model: process.env.LLM_MODEL || defaultModel,
+    baseUrl: process.env.LLM_BASE_URL || defaultBaseUrl,
+    apiKey: process.env.LLM_API_KEY || process.env.GEMINI_API_KEY || "ollama",
   },
 
   // ─── Server ─────────────────────────────────────────────────────────────

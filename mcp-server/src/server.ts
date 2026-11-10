@@ -34,11 +34,11 @@ export function createMcpServer(): McpServer {
       "and estimated delivery. Use this when a customer asks about their order.",
     {
       order_id: z.string().optional().describe("Order ID like ORD-1001"),
-      email: z.string().email().optional().describe("Customer email address"),
-      status: OrderStatus.optional().describe("Filter by order status"),
+      email: z.string().optional().describe("Customer email address"),
+      status: z.string().optional().describe("Filter by order status"),
     },
     async ({ order_id, email, status }) => {
-      const results = orderLookup({ order_id, email, status });
+      const results = orderLookup({ order_id, email, status: status as any });
 
       if (results.length === 0) {
         return {
@@ -66,9 +66,10 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "inventory_check",
-    "Check product inventory and stock levels. Search by product ID, " +
+    "Check product inventory, stock levels, and product availability. Search by product ID, " +
       "product name (partial match supported), or product category. " +
-      "Returns stock quantity, price, and availability status.",
+      "Returns stock quantity, price, and availability status. " +
+      "Use this whenever a customer asks if an item or product is available or in stock.",
     {
       product_id: z.string().optional().describe("Product ID like PROD-001"),
       product_name: z
@@ -110,28 +111,31 @@ export function createMcpServer(): McpServer {
     "policy_search",
     "Search company policy documents using semantic and hybrid similarity. " +
       "Covers return policies, shipping policies, compensation policies, " +
-      "and warranty information. Use this when a customer asks about policies, " +
-      "returns, refunds, warranties, shipping times, or compensation for issues.",
+      "and warranty information. Use this ONLY when a customer asks about company policies, " +
+      "returns, refunds, warranties, shipping times, or compensation for issues. " +
+      "DO NOT call this tool for checking product availability, inventory stock, or order status.",
     {
       query: z
         .string()
+        .optional()
         .describe(
           "Natural language question about company policies, e.g. 'what is the return policy for electronics?'"
         ),
       top_k: z
         .number()
-        .int()
-        .min(1)
-        .max(10)
         .optional()
         .describe("Number of relevant policy chunks to return (default 3)"),
       method: z
-        .enum(["dense", "bm25", "hybrid"])
+        .string()
         .optional()
         .describe("Retrieval method: dense (semantic), bm25 (keyword), or hybrid (RRF fusion)"),
     },
     async ({ query, top_k, method }) => {
-      const results = await policySearch({ query, top_k, method });
+      const sanitizedQuery = (query && query.trim().length > 0) ? query.trim() : "customer return and refund policy";
+      const sanitizedMethod = (method === "dense" || method === "bm25" || method === "hybrid") ? method : "hybrid";
+      const sanitizedTopK = typeof top_k === "number" && top_k > 0 ? Math.min(Math.round(top_k), 10) : 3;
+
+      const results = await policySearch({ query: sanitizedQuery, top_k: sanitizedTopK, method: sanitizedMethod });
 
       if (results.results.length === 0) {
         return {
@@ -174,23 +178,25 @@ export function createMcpServer(): McpServer {
     {
       customer_message: z
         .string()
+        .optional()
         .describe("The customer's original message or question"),
       context: z
         .string()
+        .optional()
         .describe(
           "Context gathered from other tools — order details, policy info, inventory data"
         ),
       tone: z
-        .enum(["empathetic", "professional", "concise"])
+        .string()
         .optional()
         .describe("Response tone (default: professional)"),
     },
     async ({ customer_message, context, tone }) => {
       try {
         const result = await responseDraft({
-          customer_message,
-          context,
-          tone,
+          customer_message: customer_message || "Support inquiry",
+          context: context || "No additional context",
+          tone: (tone === "empathetic" || tone === "concise") ? tone : "professional",
         });
 
         return {

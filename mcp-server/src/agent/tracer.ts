@@ -54,6 +54,7 @@ const PRICING_TABLE: Record<string, { prompt: number; completion: number }> = {
   "llama3.2": { prompt: 0.0, completion: 0.0 },
   "llama3.1": { prompt: 0.0, completion: 0.0 },
   // Groq hosted models
+  "openai/gpt-oss-120b": { prompt: 0.0006, completion: 0.0008 },
   "llama-3.3-70b-versatile": { prompt: 0.00059, completion: 0.00079 },
   "llama-3.1-8b-instant": { prompt: 0.00005, completion: 0.00008 },
   "mixtral-8x7b-32768": { prompt: 0.00024, completion: 0.00024 },

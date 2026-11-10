@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { AgentMcpClient } from "../src/agent/mcp-client.js";
+import { cleanToolArguments } from "../src/agent/orchestrator.js";
 
 describe("Model Context Protocol (MCP) Client-Server Integration", () => {
   let mcpClient: AgentMcpClient;
@@ -55,6 +56,34 @@ describe("Model Context Protocol (MCP) Client-Server Integration", () => {
 
     // Zod schema error or graceful validation response
     expect(typeof result.content).toBe("string");
+  });
+
+  it("should normalize complex JSON Schema wrapper and malformed arguments from local LLMs", () => {
+    // Model emits nested schema wrapper: { type: "object", properties: { ... } }
+    const cleaned = cleanToolArguments(
+      "policy_search",
+      {
+        type: "object",
+        properties: {
+          method: "dense",
+          query: "what is the return policy for electronics?",
+          top_k: {},
+        },
+      },
+      "What is the return policy?"
+    );
+
+    expect(cleaned.query).toBe("what is the return policy for electronics?");
+    expect(cleaned.method).toBe("dense");
+    expect(cleaned.top_k).toBeUndefined(); // Empty object was cleanly stripped
+
+    // Model omits order_id in order_lookup
+    const cleanedOrder = cleanToolArguments(
+      "order_lookup",
+      {},
+      "Please check ORD-1002 status"
+    );
+    expect(cleanedOrder.order_id).toBe("ORD-1002");
   });
 });
 
