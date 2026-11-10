@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ecom"
 version = "2.0.0"
-description = "Unified E-Commerce Support Copilot with PostgreSQL + pgvector, MCP Tools & ReAct Agent"
+description = "Unified E-Commerce Support with PostgreSQL + pgvector, MCP Tools & ReAct Agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

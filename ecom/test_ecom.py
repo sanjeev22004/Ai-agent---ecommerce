@@ -83,7 +83,7 @@ async def run_tests():
         data = res.json()
         logger.info("Coding triage response: %s", data["response"])
         assert len(data["tool_calls"]) == 0
-        assert "E-Commerce Support Copilot" in data["response"]
+        assert "E-Commerce Support" in data["response"]
 
         # 7. Test Customer Order Inquiry (Alice's own order ORD-2024-001)
         logger.info("--> Testing Order Inquiry for Alice (ORD-2024-001)...")

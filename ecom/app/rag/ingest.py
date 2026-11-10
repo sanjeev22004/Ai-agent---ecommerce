@@ -28,10 +28,9 @@ def get_embedding_model() -> SentenceTransformer:
     if _embedding_model is None:
         logger.info("Loading embedding model '%s'...", settings.EMBEDDING_MODEL)
         try:
-            _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
-        except Exception as err:
-            logger.warning("Normal load failed (%s), trying local_files_only=True...", err)
             _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL, local_files_only=True)
+        except Exception:
+            _embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
         logger.info("Embedding model loaded successfully.")
     return _embedding_model
 

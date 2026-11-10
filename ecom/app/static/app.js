@@ -7,7 +7,6 @@ const STATE = {
   currentUser: null,
   activeSessionId: null,
   isTraceOpen: false,
-  availableUsers: [],
 };
 
 // ─── DOM References ──────────────────────────────────────────────────────────
@@ -15,7 +14,9 @@ const dom = {
   app: document.getElementById("app"),
   userName: document.getElementById("userName"),
   userRole: document.getElementById("userRole"),
-  switchUserBtn: document.getElementById("switchUserBtn"),
+  userBadge: document.getElementById("userBadge"),
+  loginModalBtn: document.getElementById("loginModalBtn"),
+  logoutBtn: document.getElementById("logoutBtn"),
   themeToggleBtn: document.getElementById("themeToggleBtn"),
   traceToggleBtn: document.getElementById("traceToggleBtn"),
   newChatBtn: document.getElementById("newChatBtn"),
@@ -35,12 +36,29 @@ const dom = {
   metricPromptTokens: document.getElementById("metricPromptTokens"),
   metricCompTokens: document.getElementById("metricCompTokens"),
   traceId: document.getElementById("traceId"),
+  traceUserDetails: document.getElementById("traceUserDetails"),
   traceStatus: document.getElementById("traceStatus"),
   stepsList: document.getElementById("stepsList"),
-  userModal: document.getElementById("userModal"),
-  closeModalBtn: document.getElementById("closeModalBtn"),
-  customersList: document.getElementById("customersList"),
-  adminsList: document.getElementById("adminsList"),
+
+  // Authentication Modal Elements
+  authModal: document.getElementById("authModal"),
+  closeAuthModalBtn: document.getElementById("closeAuthModalBtn"),
+  tabSignIn: document.getElementById("tabSignIn"),
+  tabSignUp: document.getElementById("tabSignUp"),
+  signInForm: document.getElementById("signInForm"),
+  signUpForm: document.getElementById("signUpForm"),
+  loginIdentifier: document.getElementById("loginIdentifier"),
+  loginPassword: document.getElementById("loginPassword"),
+  signInSubmitBtn: document.getElementById("signInSubmitBtn"),
+  loginError: document.getElementById("loginError"),
+  goToSignUpLink: document.getElementById("goToSignUpLink"),
+  signupName: document.getElementById("signupName"),
+  signupEmail: document.getElementById("signupEmail"),
+  signupPassword: document.getElementById("signupPassword"),
+  signupRole: document.getElementById("signupRole"),
+  signUpSubmitBtn: document.getElementById("signUpSubmitBtn"),
+  signUpError: document.getElementById("signUpError"),
+  goToSignInLink: document.getElementById("goToSignInLink"),
 };
 
 // ─── API Client Helper ────────────────────────────────────────────────────────
@@ -58,7 +76,10 @@ async function api(endpoint, options = {}) {
     console.warn("Session unauthorized. Clearing token.");
     localStorage.removeItem("ecom_token");
     STATE.token = null;
-    await performDefaultLogin();
+    STATE.currentUser = null;
+    updateUserUI();
+    openAuthModal("signin");
+    showAuthError("login", "Your session has expired. Please sign in again.");
     return null;
   }
   if (!res.ok) {
@@ -68,41 +89,20 @@ async function api(endpoint, options = {}) {
   return res.json();
 }
 
-// ─── Authentication & User Switching ──────────────────────────────────────────
-async function performLogin(email, password = "user123") {
-  try {
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    if (!res.ok) throw new Error("Login failed");
-    const data = await res.json();
-    STATE.token = data.access_token;
-    localStorage.setItem("ecom_token", STATE.token);
-    STATE.currentUser = data.user;
-    updateUserUI();
-    await loadSessions();
-    if (STATE.currentUser.role === "admin") {
-      await loadPendingRefunds();
-    }
-  } catch (err) {
-    console.error("Login error:", err);
-  }
-}
-
-async function performDefaultLogin() {
-  await performLogin("alice@email.com", "user123");
-}
-
+// ─── Authentication Handlers ──────────────────────────────────────────────────
 async function loadCurrentUser() {
   if (!STATE.token) {
-    await performDefaultLogin();
+    updateUserUI();
+    openAuthModal("signin");
     return;
   }
   try {
     const user = await api("/api/auth/me");
-    if (!user) return;
+    if (!user) {
+      updateUserUI();
+      openAuthModal("signin");
+      return;
+    }
     STATE.currentUser = user;
     updateUserUI();
     await loadSessions();
@@ -110,61 +110,263 @@ async function loadCurrentUser() {
       await loadPendingRefunds();
     }
   } catch (err) {
-    console.warn("Could not load current user, defaulting:", err);
-    await performDefaultLogin();
+    console.warn("Could not load current user:", err);
+    STATE.token = null;
+    STATE.currentUser = null;
+    localStorage.removeItem("ecom_token");
+    updateUserUI();
+    openAuthModal("signin");
   }
 }
 
 function updateUserUI() {
-  if (!STATE.currentUser) return;
-  dom.userName.textContent = STATE.currentUser.name;
-  dom.userRole.textContent = STATE.currentUser.role;
-  dom.userRole.className = `role-pill ${STATE.currentUser.role}`;
+  const isLoggedIn = !!STATE.currentUser;
 
-  if (STATE.currentUser.role === "admin") {
-    dom.adminPanel.classList.remove("hidden");
-  } else {
-    dom.adminPanel.classList.add("hidden");
-  }
-}
-
-async function loadAvailableUsers() {
-  try {
-    const users = await api("/api/auth/users");
-    STATE.availableUsers = users || [];
-    renderUsersModal();
-  } catch (err) {
-    console.error("Failed to fetch user list:", err);
-  }
-}
-
-function renderUsersModal() {
-  dom.customersList.innerHTML = "";
-  dom.adminsList.innerHTML = "";
-
-  STATE.availableUsers.forEach((u) => {
-    const btn = document.createElement("button");
-    btn.className = "user-option-btn";
-    btn.innerHTML = `
-      <div>
-        <div class="user-opt-name">${u.name}</div>
-        <div class="user-opt-email">${u.email}</div>
-      </div>
-      <span class="role-pill ${u.role}">${u.role}</span>
-    `;
-    btn.onclick = async () => {
-      dom.userModal.classList.add("hidden");
-      const defaultPass = u.role === "admin" ? "admin123" : "user123";
-      await performLogin(u.email, defaultPass);
-      startNewChat();
-    };
-
-    if (u.role === "admin") {
-      dom.adminsList.appendChild(btn);
-    } else {
-      dom.customersList.appendChild(btn);
+  if (isLoggedIn) {
+    if (dom.userBadge) {
+      dom.userBadge.classList.remove("hidden");
+      dom.userBadge.style.display = "flex";
     }
-  });
+    if (dom.userName) dom.userName.textContent = STATE.currentUser.name;
+    if (dom.userRole) {
+      dom.userRole.textContent = STATE.currentUser.role;
+      dom.userRole.className = `role-pill ${STATE.currentUser.role}`;
+    }
+    if (dom.loginModalBtn) {
+      dom.loginModalBtn.classList.add("hidden");
+      dom.loginModalBtn.style.display = "none";
+    }
+    if (dom.logoutBtn) {
+      dom.logoutBtn.classList.remove("hidden");
+      dom.logoutBtn.style.display = "inline-flex";
+    }
+  } else {
+    if (dom.userBadge) {
+      dom.userBadge.classList.add("hidden");
+      dom.userBadge.style.display = "none";
+    }
+    if (dom.loginModalBtn) {
+      dom.loginModalBtn.classList.remove("hidden");
+      dom.loginModalBtn.style.display = "inline-flex";
+    }
+    if (dom.logoutBtn) {
+      dom.logoutBtn.classList.add("hidden");
+      dom.logoutBtn.style.display = "none";
+    }
+  }
+
+  const isAdmin = isLoggedIn && STATE.currentUser.role === "admin";
+
+  // Feature: Remove Admin Panel and Trace Inspector completely from Customer view
+  if (isAdmin) {
+    if (dom.adminPanel) {
+      dom.adminPanel.classList.remove("hidden");
+      dom.adminPanel.style.display = "block";
+    }
+    if (dom.traceToggleBtn) {
+      dom.traceToggleBtn.classList.remove("hidden");
+      dom.traceToggleBtn.style.display = "inline-flex";
+    }
+  } else {
+    if (dom.adminPanel) {
+      dom.adminPanel.classList.add("hidden");
+      dom.adminPanel.style.display = "none";
+    }
+    if (dom.traceToggleBtn) {
+      dom.traceToggleBtn.classList.add("hidden");
+      dom.traceToggleBtn.style.display = "none";
+    }
+    if (STATE.isTraceOpen) {
+      toggleTraceDrawer();
+    }
+  }
+}
+
+// ─── Auth Modal Management ────────────────────────────────────────────────────
+function openAuthModal(tab = "signin") {
+  if (dom.authModal) {
+    dom.authModal.classList.remove("hidden");
+    dom.authModal.style.display = "flex";
+  }
+  switchAuthTab(tab);
+}
+
+function closeAuthModal() {
+  if (dom.authModal) {
+    dom.authModal.classList.add("hidden");
+    dom.authModal.style.display = "none";
+  }
+  clearAuthErrors();
+}
+
+function switchAuthTab(tab) {
+  clearAuthErrors();
+  if (tab === "signin") {
+    if (dom.tabSignIn) dom.tabSignIn.classList.add("active");
+    if (dom.tabSignUp) dom.tabSignUp.classList.remove("active");
+    if (dom.signInForm) {
+      dom.signInForm.classList.remove("hidden");
+      dom.signInForm.style.display = "block";
+    }
+    if (dom.signUpForm) {
+      dom.signUpForm.classList.add("hidden");
+      dom.signUpForm.style.display = "none";
+    }
+    if (dom.loginIdentifier) setTimeout(() => dom.loginIdentifier.focus(), 80);
+  } else {
+    if (dom.tabSignUp) dom.tabSignUp.classList.add("active");
+    if (dom.tabSignIn) dom.tabSignIn.classList.remove("active");
+    if (dom.signUpForm) {
+      dom.signUpForm.classList.remove("hidden");
+      dom.signUpForm.style.display = "block";
+    }
+    if (dom.signInForm) {
+      dom.signInForm.classList.add("hidden");
+      dom.signInForm.style.display = "none";
+    }
+    if (dom.signupName) setTimeout(() => dom.signupName.focus(), 80);
+  }
+}
+
+function clearAuthErrors() {
+  if (dom.loginError) {
+    dom.loginError.textContent = "";
+    dom.loginError.classList.add("hidden");
+    dom.loginError.style.display = "none";
+  }
+  if (dom.signUpError) {
+    dom.signUpError.textContent = "";
+    dom.signUpError.classList.add("hidden");
+    dom.signUpError.style.display = "none";
+  }
+}
+
+function showAuthError(form, msg) {
+  const el = form === "login" ? dom.loginError : dom.signUpError;
+  if (el) {
+    el.textContent = msg;
+    el.classList.remove("hidden");
+    el.style.display = "block";
+  }
+}
+
+async function handleSignInSubmit(e) {
+  if (e) e.preventDefault();
+  clearAuthErrors();
+
+  const identifier = dom.loginIdentifier.value.trim();
+  const password = dom.loginPassword.value;
+
+  if (!identifier || !password) {
+    showAuthError("login", "Please enter both User ID/Email and password.");
+    return;
+  }
+
+  dom.signInSubmitBtn.disabled = true;
+  dom.signInSubmitBtn.textContent = "Signing In...";
+
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier, password }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showAuthError("login", data.detail || "Invalid User ID/Email or password.");
+      return;
+    }
+
+    STATE.token = data.access_token;
+    localStorage.setItem("ecom_token", STATE.token);
+    STATE.currentUser = data.user;
+
+    closeAuthModal();
+    updateUserUI();
+    await loadSessions();
+    if (STATE.currentUser.role === "admin") {
+      await loadPendingRefunds();
+    }
+    startNewChat();
+  } catch (err) {
+    showAuthError("login", "Authentication error: " + err.message);
+  } finally {
+    dom.signInSubmitBtn.disabled = false;
+    dom.signInSubmitBtn.textContent = "Sign In";
+  }
+}
+
+async function handleSignUpSubmit(e) {
+  if (e) e.preventDefault();
+  clearAuthErrors();
+
+  const name = dom.signupName.value.trim();
+  const email = dom.signupEmail.value.trim();
+  const password = dom.signupPassword.value;
+  const role = dom.signupRole.value;
+
+  if (!name || !email || !password) {
+    showAuthError("signup", "All fields are required.");
+    return;
+  }
+  if (!email.includes("@")) {
+    showAuthError("signup", "Please enter a valid email address.");
+    return;
+  }
+  if (password.length < 6) {
+    showAuthError("signup", "Password must be at least 6 characters.");
+    return;
+  }
+
+  dom.signUpSubmitBtn.disabled = true;
+  dom.signUpSubmitBtn.textContent = "Creating Account...";
+
+  try {
+    const res = await fetch("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, email, password, role }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showAuthError("signup", data.detail || "Registration failed.");
+      return;
+    }
+
+    STATE.token = data.access_token;
+    localStorage.setItem("ecom_token", STATE.token);
+    STATE.currentUser = data.user;
+
+    closeAuthModal();
+    updateUserUI();
+    await loadSessions();
+    if (STATE.currentUser.role === "admin") {
+      await loadPendingRefunds();
+    }
+    startNewChat();
+  } catch (err) {
+    showAuthError("signup", "Registration error: " + err.message);
+  } finally {
+    dom.signUpSubmitBtn.disabled = false;
+    dom.signUpSubmitBtn.textContent = "Create Account";
+  }
+}
+
+function handleLogout() {
+  localStorage.removeItem("ecom_token");
+  STATE.token = null;
+  STATE.currentUser = null;
+  STATE.activeSessionId = null;
+
+  if (dom.sessionsList) {
+    dom.sessionsList.innerHTML = '<div class="empty-state-sm">Sign in to view conversations</div>';
+  }
+
+  startNewChat();
+  updateUserUI();
+  openAuthModal("signin");
 }
 
 // ─── Sessions & Chat History ──────────────────────────────────────────────────
@@ -308,13 +510,17 @@ function scrollChatToBottom() {
 // ─── Sending Messages ─────────────────────────────────────────────────────────
 async function handleSendMessage(e) {
   if (e) e.preventDefault();
+  if (!STATE.token || !STATE.currentUser) {
+    openAuthModal("signin");
+    showAuthError("login", "Please sign in or create an account to start chatting.");
+    return;
+  }
   const msg = dom.messageInput.value.trim();
   if (!msg) return;
 
   dom.messageInput.value = "";
   dom.messageInput.style.height = "auto";
 
-  // Remove hero if first message
   const hero = dom.chatMessages.querySelector(".welcome-hero");
   if (hero) hero.remove();
 
@@ -356,6 +562,23 @@ function updateTraceInspector(trace) {
   dom.metricCost.textContent = `$${(trace.estimated_cost_usd || 0).toFixed(6)}`;
   dom.metricPromptTokens.textContent = trace.prompt_tokens || 0;
   dom.metricCompTokens.textContent = trace.completion_tokens || 0;
+
+  // Feature: Display User Details in Traces
+  if (dom.traceUserDetails) {
+    const u = trace.user_details;
+    if (u && typeof u === "object") {
+      dom.traceUserDetails.textContent = `${u.name || ""} (${u.email || ""}) [${u.role || ""}]`;
+    } else if (typeof u === "string") {
+      try {
+        const parsed = JSON.parse(u);
+        dom.traceUserDetails.textContent = `${parsed.name} (${parsed.email}) [${parsed.role}]`;
+      } catch {
+        dom.traceUserDetails.textContent = u;
+      }
+    } else {
+      dom.traceUserDetails.textContent = "-";
+    }
+  }
 
   dom.traceStatus.textContent = trace.status || "success";
   dom.traceStatus.className = `status-badge ${trace.status === "success" ? "status-success" : ""}`;
@@ -432,10 +655,33 @@ async function approveRefund(refundId) {
   }
 }
 
+// ─── Dynamic Re-embedding ────────────────────────────────────────────────────
+async function handleReembed() {
+  if (!confirm("Re-chunk and compute fresh embeddings for all documents in data/policies/?")) return;
+  dom.reembedBtn.disabled = true;
+  dom.reembedBtn.innerHTML = `<span>⏳</span> Embedding...`;
+  try {
+    const data = await api("/api/admin/reembed", { method: "POST" });
+    if (data) {
+      alert(data.message || `Successfully re-embedded ${data.chunks_count} policy sections!`);
+    }
+  } catch (err) {
+    alert(`Re-embedding failed: ${err.message}`);
+  } finally {
+    dom.reembedBtn.disabled = false;
+    dom.reembedBtn.innerHTML = `<span>🔄</span> Re-embed Policies`;
+  }
+}
+
 // ─── Suggestion Chips ─────────────────────────────────────────────────────────
 function attachSuggestionListeners() {
   document.querySelectorAll(".suggestion-chip").forEach((chip) => {
     chip.onclick = () => {
+      if (!STATE.token || !STATE.currentUser) {
+        openAuthModal("signin");
+        showAuthError("login", "Please sign in or create an account to start chatting.");
+        return;
+      }
       const prompt = chip.getAttribute("data-prompt");
       if (prompt) {
         dom.messageInput.value = prompt;
@@ -457,17 +703,38 @@ function initEvents() {
   };
 
   dom.newChatBtn.onclick = startNewChat;
+  dom.reembedBtn.onclick = handleReembed;
   dom.traceToggleBtn.onclick = toggleTraceDrawer;
   dom.closeTraceBtn.onclick = toggleTraceDrawer;
 
-  dom.switchUserBtn.onclick = () => {
-    loadAvailableUsers();
-    dom.userModal.classList.remove("hidden");
-  };
-
-  dom.closeModalBtn.onclick = () => {
-    dom.userModal.classList.add("hidden");
-  };
+  // Authentication UI events
+  if (dom.loginModalBtn) {
+    dom.loginModalBtn.onclick = () => openAuthModal("signin");
+  }
+  if (dom.logoutBtn) {
+    dom.logoutBtn.onclick = handleLogout;
+  }
+  if (dom.closeAuthModalBtn) {
+    dom.closeAuthModalBtn.onclick = closeAuthModal;
+  }
+  if (dom.tabSignIn) {
+    dom.tabSignIn.onclick = () => switchAuthTab("signin");
+  }
+  if (dom.tabSignUp) {
+    dom.tabSignUp.onclick = () => switchAuthTab("signup");
+  }
+  if (dom.goToSignUpLink) {
+    dom.goToSignUpLink.onclick = () => switchAuthTab("signup");
+  }
+  if (dom.goToSignInLink) {
+    dom.goToSignInLink.onclick = () => switchAuthTab("signin");
+  }
+  if (dom.signInForm) {
+    dom.signInForm.onsubmit = handleSignInSubmit;
+  }
+  if (dom.signUpForm) {
+    dom.signUpForm.onsubmit = handleSignUpSubmit;
+  }
 
   dom.themeToggleBtn.onclick = () => {
     const currentTheme = document.documentElement.getAttribute("data-theme") || "dark";
@@ -484,4 +751,3 @@ window.addEventListener("DOMContentLoaded", async () => {
   initEvents();
   await loadCurrentUser();
 });
-

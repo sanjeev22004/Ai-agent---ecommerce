@@ -69,11 +69,18 @@ class TraceStep:
 
 
 class ActiveTrace:
-    def __init__(self, session_id: Optional[str], user_message: str, model_name: str = "openai/gpt-oss-120b"):
+    def __init__(
+        self,
+        session_id: Optional[str],
+        user_message: str,
+        model_name: str = "openai/gpt-oss-120b",
+        user_details: Optional[Dict[str, Any]] = None,
+    ):
         self.trace_id = f"trc-{uuid.uuid4().hex[:12]}"
         self.session_id = session_id
         self.user_message = user_message
         self.model_name = model_name
+        self.user_details = user_details or {}
         self.start_time = time.perf_counter()
         self.steps: List[TraceStep] = []
         self.step_counter = 0
@@ -98,6 +105,7 @@ class ActiveTrace:
         return {
             "trace_id": self.trace_id,
             "session_id": self.session_id,
+            "user_details": self.user_details,
             "user_message": self.user_message,
             "final_response": final_response,
             "total_latency_ms": total_latency_ms,

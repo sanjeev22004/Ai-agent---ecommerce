@@ -163,7 +163,19 @@ class AgentOrchestrator:
         chat_session = await self.get_or_create_session(
             db_session, user, session_id, first_message=user_message
         )
-        trace = ActiveTrace(chat_session.id, user_message, model_name=self.model_name)
+        user_info = {
+            "user_id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+        }
+        user_details_json = json.dumps(user_info)
+        trace = ActiveTrace(
+            chat_session.id,
+            user_message,
+            model_name=self.model_name,
+            user_details=user_info,
+        )
 
         # ── 1. Off-Topic Triage ───────────────────────────────────────────────
         direct_reply = triage_message(user_message)
@@ -190,6 +202,7 @@ class AgentOrchestrator:
             final_trace = trace.finalize(direct_reply, status="triage_direct")
             db_trace = ExecutionTrace(
                 session_id=chat_session.id,
+                user_details=user_details_json,
                 trace_id=final_trace["trace_id"],
                 user_message=user_message,
                 final_response=direct_reply,
@@ -369,6 +382,7 @@ class AgentOrchestrator:
 
         db_trace = ExecutionTrace(
             session_id=chat_session.id,
+            user_details=user_details_json,
             trace_id=final_trace["trace_id"],
             user_message=user_message,
             final_response=final_text,

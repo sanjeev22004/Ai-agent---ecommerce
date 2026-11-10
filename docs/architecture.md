@@ -2,7 +2,7 @@
 
 ## 1. System Overview
 
-The **E-Commerce Support Copilot** is a production-grade agentic resolution system designed to resolve complex customer inquiries across orders, returns, warranty, and compensation policies.
+The **E-Commerce Support ** is a production-grade agentic resolution system designed to resolve complex customer inquiries across orders, returns, warranty, and compensation policies.
 
 The system is architected as a decoupled, multi-runtime service:
 - **TypeScript Runtime (`mcp-server`)**: Runs the Express HTTP API, genuine Model Context Protocol (MCP) server & client, SQLite transactional ERP database, and stateful session orchestrator.

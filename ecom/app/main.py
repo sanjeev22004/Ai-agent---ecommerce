@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="ecom - Unified E-Commerce Copilot",
+    title="ecom - Unified E-Commerce ",
     version="2.0.0",
     description="Unified Python e-commerce support system with PostgreSQL + pgvector, MCP tools & ReAct agent.",
     lifespan=lifespan,
@@ -297,9 +297,16 @@ async def list_execution_traces(
             steps = json.loads(t.steps_json)
         except Exception:
             steps = []
+        u_details = None
+        if t.user_details:
+            try:
+                u_details = json.loads(t.user_details)
+            except Exception:
+                u_details = {"raw": t.user_details}
         output.append({
             "trace_id": t.trace_id,
             "session_id": t.session_id,
+            "user_details": u_details,
             "user_message": t.user_message,
             "final_response": t.final_response,
             "total_latency_ms": t.total_latency_ms,

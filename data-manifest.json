@@ -1,6 +1,6 @@
 {
   "manifest_version": "1.0.0",
-  "project_name": "Agentic AI E-Commerce Support Copilot",
+  "project_name": "Agentic AI E-Commerce Support ",
   "data_governance": {
     "confidentiality_statement": "All operational customer records, order records, and policy documents in this repository are strictly synthetic or derived from public standard e-commerce retail policies. No real personal records, private customer data, or proprietary client data is ingested.",
     "compliance": "Compliant with assignment safety rules and GDPR synthetic data generation guidelines."
@@ -45,10 +45,26 @@
       "source_lineage": "Programmatically generated via mcp-server/src/db/seed.ts using faker-style realistic retail data schemas matching Microsoft Dynamics 365 / SAP Sales Orders schema conventions.",
       "license": "Project Internal / Synthetic",
       "tables": [
-        { "name": "customers", "row_count": 10, "description": "Customer profiles, contact info, shipping addresses" },
-        { "name": "products", "row_count": 20, "description": "Catalog items across 6 categories with stock and warranty months" },
-        { "name": "orders", "row_count": 50, "description": "Transactional order records with tracking numbers and statuses" },
-        { "name": "order_items", "row_count": 102, "description": "Line items linked to orders and catalog products" }
+        {
+          "name": "customers",
+          "row_count": 10,
+          "description": "Customer profiles, contact info, shipping addresses"
+        },
+        {
+          "name": "products",
+          "row_count": 20,
+          "description": "Catalog items across 6 categories with stock and warranty months"
+        },
+        {
+          "name": "orders",
+          "row_count": 50,
+          "description": "Transactional order records with tracking numbers and statuses"
+        },
+        {
+          "name": "order_items",
+          "row_count": 102,
+          "description": "Line items linked to orders and catalog products"
+        }
       ],
       "is_synthetic": true
     }
@@ -62,9 +78,12 @@
   },
   "ingestion_pipeline": {
     "script": "rag-service/src/ingest.py",
-    "supports_formats": ["markdown (.md)", "json (.json)", "pdf (.pdf fallback)"],
+    "supports_formats": [
+      "markdown (.md)",
+      "json (.json)",
+      "pdf (.pdf fallback)"
+    ],
     "chunking_strategy": "Semantic paragraph windowing with overlap (500 chars window, 50 chars overlap) for Markdown; discrete item mapping for JSON FAQs.",
     "repeatability": "Idempotent collection recreation with hash tracking and metadata retention (source, format, category, chunk_id)."
   }
 }
-

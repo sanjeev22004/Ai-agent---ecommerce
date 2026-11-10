@@ -7,13 +7,14 @@ and auth endpoints.
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Optional
+import uuid
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -29,8 +30,16 @@ router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 # ─── Pydantic Schemas ────────────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    email: str
+    identifier: Optional[str] = None  # User ID, Email, or Name
+    email: Optional[str] = None       # Backward compatibility
     password: str
+
+
+class SignupRequest(BaseModel):
+    name: str                         # Display Name / Username / User ID
+    email: str                        # Valid email address
+    password: str                     # Password
+    role: Optional[str] = "customer"  # 'customer' | 'admin'
 
 
 class UserOut(BaseModel):
@@ -159,16 +168,29 @@ async def login(
     request: LoginRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Authenticate user with email/password and issue JWT."""
+    """Authenticate user with User ID/Email and password, then issue JWT."""
+    ident = (request.identifier or request.email or "").strip()
+    if not ident:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User ID or Email is required.",
+        )
+
     result = await session.execute(
-        select(User).where(User.email == request.email.lower().strip())
+        select(User).where(
+            or_(
+                func.lower(User.email) == ident.lower(),
+                func.lower(User.id) == ident.lower(),
+                func.lower(User.name) == ident.lower(),
+            )
+        )
     )
     user = result.scalar_one_or_none()
 
     if not user or not verify_password(request.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
+            detail="Invalid User ID/Email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -185,6 +207,80 @@ async def login(
         access_token=access_token,
         token_type="bearer",
         user=UserOut.model_validate(user),
+    )
+
+
+@router.post("/signup", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def signup(
+    request: SignupRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Register a new user account with ID/Name, Email and Password, then issue JWT."""
+    name = request.name.strip()
+    email = request.email.strip().lower()
+    password = request.password.strip()
+    role = (request.role or "customer").strip().lower()
+
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User ID or Name is required.",
+        )
+    if not email or "@" not in email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A valid email address is required.",
+        )
+    if len(password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 6 characters long.",
+        )
+    if role not in ("customer", "admin"):
+        role = "customer"
+
+    # Check for existing email or name
+    existing_user = await session.execute(
+        select(User).where(
+            or_(
+                func.lower(User.email) == email,
+                func.lower(User.name) == name.lower(),
+            )
+        )
+    )
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An account with this email or User ID already exists.",
+        )
+
+    new_id = f"USR-{uuid.uuid4().hex[:8].upper()}"
+    new_user = User(
+        id=new_id,
+        name=name,
+        email=email,
+        password_hash=hash_password(password),
+        role=role,
+    )
+    session.add(new_user)
+    await session.commit()
+    await session.refresh(new_user)
+
+    logger.info("Successfully registered new %s user: %s (%s)", role, name, email)
+
+    access_token = create_access_token(
+        data={
+            "user_id": new_user.id,
+            "email": new_user.email,
+            "role": new_user.role,
+            "name": new_user.name,
+        }
+    )
+
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserOut.model_validate(new_user),
     )
 
 

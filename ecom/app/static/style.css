@@ -90,6 +90,11 @@ body {
   font-family: var(--font-mono);
 }
 
+/* ─── Global Utility Classes ──────────────────────────────────────────────── */
+.hidden {
+  display: none !important;
+}
+
 /* ─── Layout ──────────────────────────────────────────────────────────────── */
 .app-layout {
   display: flex;
@@ -297,6 +302,10 @@ body {
   margin-top: auto;
   border-top: 1px solid var(--border-color);
   padding-top: 14px;
+}
+
+.admin-panel.hidden {
+  display: none !important;
 }
 
 .admin-title {
@@ -802,46 +811,162 @@ textarea#messageInput {
   margin-bottom: 14px;
 }
 
-.role-group-title {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  margin: 12px 0 6px 0;
+/* ─── Authentication Modal & Tabs ─────────────────────────────────────────── */
+.auth-card {
+  width: 440px;
 }
 
-.user-select-list {
+.auth-modal-header {
+  padding: 0 10px 0 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-primary);
+}
+
+.auth-tabs {
+  display: flex;
+  flex: 1;
+}
+
+.auth-tab {
+  flex: 1;
+  padding: 14px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.auth-tab:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-hover);
+}
+
+.auth-tab.active {
+  color: var(--accent-primary);
+  border-bottom-color: var(--accent-primary);
+  background-color: var(--bg-secondary);
+}
+
+.auth-body {
+  padding: 20px 22px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.form-group {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.user-option-btn {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 10px 12px;
-  background-color: var(--bg-tertiary);
+.form-group label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.form-input {
+  width: 100%;
+  padding: 9px 12px;
+  background-color: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 6px;
-  cursor: pointer;
   color: var(--text-primary);
-  transition: all 0.15s;
-  text-align: left;
-}
-
-.user-option-btn:hover {
-  background-color: var(--bg-hover);
-  border-color: var(--accent-primary);
-}
-
-.user-opt-name {
-  font-weight: 600;
   font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.user-opt-email {
+.form-input:focus {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.auth-submit-btn {
+  width: 100%;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.auth-error-msg {
+  padding: 8px 12px;
+  border-radius: 6px;
+  background-color: var(--danger-bg);
+  border: 1px solid var(--danger-color);
+  color: var(--danger-color);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.demo-hints-box {
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 10px 12px;
   font-size: 11px;
+}
+
+.demo-hints-title {
+  font-weight: 600;
   color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.demo-hints-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: var(--text-secondary);
+}
+
+.demo-hints-row code {
+  background-color: var(--bg-tertiary);
+  padding: 1px 4px;
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.demo-role.customer {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.demo-role.admin {
+  color: var(--warning-color);
+  font-weight: 600;
+}
+
+.auth-switch-prompt {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
+
+.auth-switch-prompt a {
+  color: var(--accent-primary);
+  text-decoration: none;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.auth-switch-prompt a:hover {
+  text-decoration: underline;
 }
 

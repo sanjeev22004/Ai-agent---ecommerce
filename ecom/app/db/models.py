@@ -282,6 +282,7 @@ class ExecutionTrace(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("chat_sessions.id"), nullable=True, index=True)
+    user_details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     trace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     user_message: Mapped[str] = mapped_column(Text, nullable=False)
     final_response: Mapped[str] = mapped_column(Text, nullable=False)
