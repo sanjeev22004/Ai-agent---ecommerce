@@ -1,0 +1,70 @@
+{
+  "manifest_version": "1.0.0",
+  "project_name": "Agentic AI E-Commerce Support Copilot",
+  "data_governance": {
+    "confidentiality_statement": "All operational customer records, order records, and policy documents in this repository are strictly synthetic or derived from public standard e-commerce retail policies. No real personal records, private customer data, or proprietary client data is ingested.",
+    "compliance": "Compliant with assignment safety rules and GDPR synthetic data generation guidelines."
+  },
+  "datasets": [
+    {
+      "id": "dataset-policies-markdown",
+      "name": "E-Commerce Customer Service Standard Operating Policies",
+      "format": "markdown (.md)",
+      "type": "unstructured_text",
+      "source_lineage": "Modeled after standard public retail e-commerce customer service policies (Amazon, BestBuy, Target standard return/shipping policies). Formatted and curated synthetically for RAG evaluation.",
+      "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+      "files": [
+        "rag-service/data/policies/compensation_policy.md",
+        "rag-service/data/policies/returns_policy.md",
+        "rag-service/data/policies/shipping_policy.md",
+        "rag-service/data/policies/warranty_policy.md"
+      ],
+      "record_count": 4,
+      "approx_tokens": 3200,
+      "is_synthetic": true
+    },
+    {
+      "id": "dataset-support-faq-json",
+      "name": "Customer Support FAQ & Operational Knowledge Catalog",
+      "format": "json (.json)",
+      "type": "semi_structured_json",
+      "source_lineage": "Synthetically generated standard retail FAQ pairs covering exceptions, lost packages, cancellation boundaries, and defect compensation.",
+      "license": "MIT License",
+      "files": [
+        "rag-service/data/policies/support_faq.json"
+      ],
+      "record_count": 5,
+      "approx_tokens": 1100,
+      "is_synthetic": true
+    },
+    {
+      "id": "dataset-operational-sqlite",
+      "name": "ERP Operational Customer, Product, and Order Records",
+      "format": "sqlite3 (.db) relational tables",
+      "type": "structured_relational",
+      "source_lineage": "Programmatically generated via mcp-server/src/db/seed.ts using faker-style realistic retail data schemas matching Microsoft Dynamics 365 / SAP Sales Orders schema conventions.",
+      "license": "Project Internal / Synthetic",
+      "tables": [
+        { "name": "customers", "row_count": 10, "description": "Customer profiles, contact info, shipping addresses" },
+        { "name": "products", "row_count": 20, "description": "Catalog items across 6 categories with stock and warranty months" },
+        { "name": "orders", "row_count": 50, "description": "Transactional order records with tracking numbers and statuses" },
+        { "name": "order_items", "row_count": 102, "description": "Line items linked to orders and catalog products" }
+      ],
+      "is_synthetic": true
+    }
+  ],
+  "embedding_model": {
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "embedding_dimension": 384,
+    "distance_metric": "cosine",
+    "license": "Apache-2.0",
+    "provenance": "Hugging Face model hub"
+  },
+  "ingestion_pipeline": {
+    "script": "rag-service/src/ingest.py",
+    "supports_formats": ["markdown (.md)", "json (.json)", "pdf (.pdf fallback)"],
+    "chunking_strategy": "Semantic paragraph windowing with overlap (500 chars window, 50 chars overlap) for Markdown; discrete item mapping for JSON FAQs.",
+    "repeatability": "Idempotent collection recreation with hash tracking and metadata retention (source, format, category, chunk_id)."
+  }
+}
+

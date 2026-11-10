@@ -1,83 +1,95 @@
 /**
- * Demo script — sends scripted scenarios to the /chat endpoint
- * and prints the agent's response + tool calls.
+ * Assignment Demonstration Script
  *
- * Shows:
- *   1. Single-tool query (order lookup)
- *   2. Single-tool query (inventory check)
- *   3. Single-tool query (policy search)
- *   4. Multi-tool chain (order + policy)
- *   5. Multi-tool chain (order + inventory)
- *   6. Edge case (non-existent order)
+ * Demonstrates the 3 mandatory assessment scenarios from the assignment document:
  *
- * Prerequisites:
- *   - MCP server running:     cd mcp-server && npm run dev
- *   - RAG service running:    cd rag-service && source venv/bin/activate && python -m src.main
- *   - LLM available:          Ollama running with llama3.2, or Groq API key set
+ * Scenario 1 — Knowledge query:
+ *   Answer question about applicable policy and show supporting source evidence.
+ *
+ * Scenario 2 — Multi-step resolution:
+ *   Given an order ID and a customer question about a return, obtain operational
+ *   details, consult relevant policy evidence, and determine the appropriate next step.
+ *
+ * Scenario 3 — Exception handling (2+ cases):
+ *   Case 3A: Non-existent order ID (safe handling, no hallucination)
+ *   Case 3B: Unverified or missing order details
+ *   Case 3C: Out-of-stock replacement inquiry
  *
  * Run with: npx tsx demo/demo.ts
  */
 
 const API_URL = process.env.API_URL || "http://localhost:3000";
 
+interface TraceMetrics {
+  totalDurationMs: number;
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  estimatedCostUsd: number;
+  llmCallsCount: number;
+  mcpToolCallsCount: number;
+  status: string;
+}
+
 interface ChatResponse {
   response: string;
+  sessionId: string;
   toolCalls: {
     tool: string;
     args: Record<string, unknown>;
     result: string;
+    durationMs?: number;
   }[];
   timing: {
     totalMs: number;
   };
+  trace?: {
+    traceId: string;
+    metrics: TraceMetrics;
+  };
 }
-
-// ─── Scenarios ───────────────────────────────────────────────────────────────
 
 const SCENARIOS = [
   {
-    name: "1. Order Lookup (single tool)",
-    description: "Customer asks about a specific order — should call order_lookup only",
-    message: "Can you check on my order ORD-1001? I want to know when it will arrive.",
-  },
-  {
-    name: "2. Inventory Check (single tool)",
-    description: "Customer asks about product availability — should call inventory_check only",
-    message: "Do you have the Wireless Bluetooth Headphones in stock?",
-  },
-  {
-    name: "3. Policy Search (single tool)",
-    description: "Customer asks about return policy — should call policy_search only",
-    message: "What is your return policy for electronics?",
-  },
-  {
-    name: "4. Order + Policy (multi-tool chain)",
+    section: "SCENARIO 1 — Knowledge Query & Source Evidence",
     description:
-      "Customer's order is late — should call order_lookup THEN policy_search for compensation",
-    message:
-      "My order ORD-1001 seems delayed. What compensation can you offer for late deliveries?",
+      "Customer asks about electronics return policy. Agent queries policy via MCP and provides supporting source citation.",
+    message: "What is your return policy for electronics, and are there any restocking fees?",
   },
   {
-    name: "5. Order + Inventory (multi-tool chain)",
+    section: "SCENARIO 2 — Multi-Step Resolution (Order + Policy + Return Decision)",
     description:
-      "Customer wants a replacement — should call order_lookup THEN inventory_check",
+      "Customer asks to return an item from ORD-1001. Agent looks up order operational data, retrieves category policy, checks window eligibility, and determines the next step.",
     message:
-      "I need to replace the Running Shoes Ultra from my order. Do you have them in stock?",
+      "I would like to return the item from my order ORD-1001. Can you check my order and let me know if I am eligible for a return and what the next step is?",
   },
   {
-    name: "6. Non-existent Order (edge case)",
-    description: "Customer references an order that doesn't exist — agent should handle gracefully",
-    message: "Where is my order ORD-9999?",
+    section: "SCENARIO 3A — Exception: Invalid / Non-Existent Order ID",
+    description:
+      "Customer queries non-existent order ORD-9999. Agent safely informs the customer without hallucinating details.",
+    message: "Where is my order ORD-9999? When will it arrive?",
+  },
+  {
+    section: "SCENARIO 3B — Exception: Delivery Delay Compensation & Policy Check",
+    description:
+      "Customer reports late shipment on ORD-1001. Agent chains order lookup with compensation policy lookup.",
+    message:
+      "My order ORD-1001 seems delayed. Can you check the delivery status and tell me what compensation policy applies?",
+  },
+  {
+    section: "SCENARIO 3C — Exception: Out of Stock Replacement Inquiry",
+    description:
+      "Customer asks for a replacement for Running Shoes Ultra (PROD-007). Agent queries inventory and detects 0 stock.",
+    message:
+      "Can I get a replacement pair of Running Shoes Ultra (PROD-007)? Are they currently in stock?",
   },
 ];
 
-// ─── Runner ──────────────────────────────────────────────────────────────────
-
-async function sendMessage(message: string): Promise<ChatResponse> {
+async function sendMessage(message: string, sessionId?: string): Promise<ChatResponse> {
   const response = await fetch(`${API_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, sessionId }),
   });
 
   if (!response.ok) {
@@ -89,65 +101,67 @@ async function sendMessage(message: string): Promise<ChatResponse> {
 }
 
 function printDivider(): void {
-  console.log("\n" + "═".repeat(70) + "\n");
+  console.log("\n" + "═".repeat(78) + "\n");
 }
 
 async function runDemo(): Promise<void> {
-  console.log("╔══════════════════════════════════════════════════════════════════════╗");
-  console.log("║              E-Commerce Support Copilot — Demo                      ║");
-  console.log("╚══════════════════════════════════════════════════════════════════════╝");
+  console.log("╔══════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║           Agentic AI Engineering — 1-Week Assignment Demo                    ║");
+  console.log("║           MCP Server + Stateful Agent + Multi-Format RAG                     ║");
+  console.log("╚══════════════════════════════════════════════════════════════════════════════╝");
 
-  // Check if the API is running
+  // Health check
   try {
-    const health = await fetch(`${API_URL}/health`);
-    if (!health.ok) throw new Error("Health check failed");
-    const healthData = (await health.json()) as Record<string, unknown>;
-    console.log(`\nAPI: ${API_URL} — healthy`);
-    console.log(`LLM: ${JSON.stringify((healthData as any).llm)}`);
-  } catch {
-    console.error(`\nError: Cannot reach API at ${API_URL}`);
-    console.error("Make sure the MCP server is running: cd mcp-server && npm run dev");
+    const health = await fetch(`${API_URL}/health`).then((r) => r.json());
+    console.log(`\nSystem Health: ${health.status.toUpperCase()}`);
+    console.log(`MCP Connected: ${health.mcp?.connected} (${health.mcp?.toolsCount} tools discovered)`);
+    console.log(`LLM Model:     ${health.llm?.model} (${health.llm?.provider})`);
+    console.log(`Orders in DB:  ${health.database?.orders}`);
+  } catch (err) {
+    console.error(`\nCould not connect to ${API_URL}. Ensure both services are running:`);
+    console.error("  1. Terminal 1: cd rag-service && python -m src.main");
+    console.error("  2. Terminal 2: cd mcp-server && npm run dev\n");
     process.exit(1);
   }
 
-  for (const scenario of SCENARIOS) {
+  let activeSessionId: string | undefined = undefined;
+
+  for (let i = 0; i < SCENARIOS.length; i++) {
+    const s = SCENARIOS[i];
     printDivider();
-    console.log(`Scenario: ${scenario.name}`);
-    console.log(`Expected: ${scenario.description}`);
-    console.log(`\nCustomer: "${scenario.message}"`);
+    console.log(`▶ [${s.section}]`);
+    console.log(`  Intent: ${s.description}\n`);
+    console.log(`  Customer: "${s.message}"\n`);
 
-    try {
-      const result = await sendMessage(scenario.message);
+    const result = await sendMessage(s.message, activeSessionId);
+    activeSessionId = result.sessionId;
 
-      // Show tool calls
-      if (result.toolCalls.length > 0) {
-        console.log(`\nTools called (${result.toolCalls.length}):`);
-        for (const call of result.toolCalls) {
-          console.log(`  → ${call.tool}(${JSON.stringify(call.args)})`);
-        }
-      } else {
-        console.log("\nNo tools called (direct response)");
+    console.log(`  ⚡ MCP Tool Calls Discovered & Executed (${result.toolCalls.length}):`);
+    if (result.toolCalls.length === 0) {
+      console.log("     (Direct response — no tools required)");
+    } else {
+      for (const tc of result.toolCalls) {
+        const duration = tc.durationMs ? `${tc.durationMs}ms` : "N/A";
+        console.log(`     → Tool: ${tc.tool} [${duration}]`);
+        console.log(`       Args:   ${JSON.stringify(tc.args)}`);
+        console.log(`       Output: ${tc.result.slice(0, 140)}...`);
       }
+    }
 
-      // Show response
-      console.log(`\nAgent Response:`);
+    console.log(`\n  🤖 Agent Response:`);
+    console.log(`     ${result.response.replace(/\n/g, "\n     ")}`);
+
+    if (result.trace) {
+      const m = result.trace.metrics;
+      console.log(`\n  📊 Observability Trace [${result.trace.traceId}]:`);
       console.log(
-        result.response
-          .split("\n")
-          .map((line) => `  ${line}`)
-          .join("\n")
-      );
-
-      console.log(`\nTiming: ${result.timing.totalMs}ms`);
-    } catch (error) {
-      console.error(
-        `\nError: ${error instanceof Error ? error.message : error}`
+        `     Latency: ${m.totalDurationMs}ms | Tokens: ${m.totalTokens} (Prompt: ${m.promptTokens}, Completion: ${m.completionTokens}) | Cost: $${m.estimatedCostUsd}`
       );
     }
   }
 
   printDivider();
-  console.log("Demo complete!\n");
+  console.log("All required demonstration scenarios completed successfully!");
 }
 
 runDemo().catch(console.error);

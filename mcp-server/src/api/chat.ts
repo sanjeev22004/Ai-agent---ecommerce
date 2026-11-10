@@ -2,21 +2,19 @@
  * Express chat endpoint — the HTTP API layer.
  *
  * POST /chat
- *   Body: { message: string, history?: { role, content }[] }
- *   Returns: { response, toolCalls, timing }
- *
- * This is how external clients interact with the agent.
- * The endpoint passes the message to the orchestrator, which handles
- * all tool calling and LLM interaction internally.
+ *   Body: { message: string, sessionId?: string, history?: ConversationMessage[] }
+ *   Returns: { response, toolCalls, sessionId, timing, trace }
  */
 
 import { Router, type Request, type Response } from "express";
 import { orchestrate, type ConversationMessage } from "../agent/orchestrator.js";
+import { SessionStore } from "../agent/session.js";
 
 export const chatRouter = Router();
 
 interface ChatRequest {
   message: string;
+  sessionId?: string;
   history?: ConversationMessage[];
 }
 
@@ -24,7 +22,7 @@ chatRouter.post("/chat", async (req: Request, res: Response) => {
   const startTime = Date.now();
 
   try {
-    const { message, history } = req.body as ChatRequest;
+    const { message, sessionId, history } = req.body as ChatRequest;
 
     if (!message || typeof message !== "string" || message.trim().length === 0) {
       res.status(400).json({
@@ -33,21 +31,28 @@ chatRouter.post("/chat", async (req: Request, res: Response) => {
       return;
     }
 
-    console.log(`\n[Chat] Received: "${message}"`);
+    const session = SessionStore.getOrCreate(sessionId);
+    if (history && history.length > 0 && session.history.length === 0) {
+      session.history = [...history];
+    }
 
-    const result = await orchestrate(message.trim(), history || []);
+    console.log(`\n[Chat] [Session ${session.sessionId}] Received: "${message}"`);
+
+    const result = await orchestrate(message.trim(), session);
 
     const elapsed = Date.now() - startTime;
     console.log(
-      `[Chat] Responded in ${elapsed}ms (${result.toolCalls.length} tool call(s))`
+      `[Chat] Responded in ${elapsed}ms (${result.toolCalls.length} MCP tool call(s))`
     );
 
     res.json({
       response: result.response,
       toolCalls: result.toolCalls,
+      sessionId: result.sessionId,
       timing: {
         totalMs: elapsed,
       },
+      trace: result.trace,
     });
   } catch (error) {
     const elapsed = Date.now() - startTime;

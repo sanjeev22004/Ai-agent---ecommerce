@@ -1,15 +1,15 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config.js";
 
-let db: Database.Database | null = null;
+let db: DatabaseSync | null = null;
 
 /**
- * Get or create the SQLite database connection.
- * Creates the data directory and tables on first call.
+ * Get or create the SQLite database connection using Node.js built-in DatabaseSync.
+ * Zero external native C++ compilation required.
  */
-export function getDb(): Database.Database {
+export function getDb(): DatabaseSync {
   if (db) return db;
 
   // Ensure data directory exists
@@ -18,11 +18,11 @@ export function getDb(): Database.Database {
     fs.mkdirSync(dbDir, { recursive: true });
   }
 
-  db = new Database(config.db.path);
+  db = new DatabaseSync(config.db.path);
 
-  // Enable WAL mode for better concurrent read performance
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+  // Enable WAL mode and foreign keys
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec("PRAGMA foreign_keys = ON;");
 
   initTables(db);
 
@@ -33,8 +33,8 @@ export function getDb(): Database.Database {
  * Create tables if they don't exist.
  * Schema mirrors a simplified e-commerce ERP (like D365 Sales Orders).
  */
-function initTables(db: Database.Database): void {
-  db.exec(`
+function initTables(database: DatabaseSync): void {
+  database.exec(`
     CREATE TABLE IF NOT EXISTS customers (
       id          TEXT PRIMARY KEY,
       name        TEXT NOT NULL,

@@ -8,6 +8,7 @@
  *   - 50 orders with 1-3 line items each
  */
 
+import type { DatabaseSync } from "node:sqlite";
 import { getDb, closeDb } from "./connection.js";
 import type { CustomerRow, ProductRow, OrderRow, OrderItemRow } from "./models.js";
 
@@ -35,6 +36,17 @@ function futureDate(daysFromNow: number): string {
 
 function padId(prefix: string, n: number, width = 3): string {
   return `${prefix}-${String(n).padStart(width, "0")}`;
+}
+
+function runTransaction(db: DatabaseSync, fn: () => void): void {
+  db.exec("BEGIN");
+  try {
+    fn();
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 // ─── Customer Data ───────────────────────────────────────────────────────────
@@ -91,7 +103,7 @@ const PRODUCTS: ProductRow[] = [
 // ─── Order Generation ────────────────────────────────────────────────────────
 
 const STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled", "returned"] as const;
-const STATUS_WEIGHTS = [0.1, 0.15, 0.2, 0.35, 0.1, 0.1]; // Mostly delivered/shipped
+const STATUS_WEIGHTS = [0.1, 0.15, 0.2, 0.35, 0.1, 0.1];
 
 function weightedStatus(): string {
   const r = Math.random();
@@ -122,9 +134,8 @@ function generateOrders(count: number): GeneratedOrder[] {
     const customer = pick(CUSTOMERS);
     const status = weightedStatus();
     const numItems = randomInt(1, 3);
-    const createdAt = randomDate(90); // Orders from the last 90 days
+    const createdAt = randomDate(90);
 
-    // Pick random products for line items
     const selectedProducts = new Set<number>();
     while (selectedProducts.size < numItems) {
       selectedProducts.add(randomInt(0, PRODUCTS.length - 1));
@@ -180,7 +191,6 @@ function seed(): void {
 
   console.log("Seeding database...\n");
 
-  // Clear existing data (order matters for foreign keys)
   db.exec("DELETE FROM order_items");
   db.exec("DELETE FROM orders");
   db.exec("DELETE FROM products");
@@ -192,12 +202,11 @@ function seed(): void {
     VALUES (?, ?, ?, ?, ?, ?)
   `);
 
-  const insertCustomers = db.transaction(() => {
+  runTransaction(db, () => {
     for (const c of CUSTOMERS) {
       insertCustomer.run(c.id, c.name, c.email, c.phone, c.address, c.created_at);
     }
   });
-  insertCustomers();
   console.log(`  Inserted ${CUSTOMERS.length} customers`);
 
   // Insert products
@@ -206,12 +215,11 @@ function seed(): void {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const insertProducts = db.transaction(() => {
+  runTransaction(db, () => {
     for (const p of PRODUCTS) {
       insertProduct.run(p.id, p.name, p.category, p.price, p.stock_quantity, p.description, p.warranty_months);
     }
   });
-  insertProducts();
   console.log(`  Inserted ${PRODUCTS.length} products`);
 
   // Generate and insert orders
@@ -228,7 +236,7 @@ function seed(): void {
   `);
 
   let totalItems = 0;
-  const insertAllOrders = db.transaction(() => {
+  runTransaction(db, () => {
     for (const { order, items } of generatedOrders) {
       insertOrder.run(
         order.id, order.customer_id, order.customer_email, order.status,
@@ -241,38 +249,21 @@ function seed(): void {
       }
     }
   });
-  insertAllOrders();
   console.log(`  Inserted ${generatedOrders.length} orders with ${totalItems} line items`);
 
   // Print summary
   const counts = {
-    customers: db.prepare("SELECT COUNT(*) as count FROM customers").get() as { count: number },
-    products: db.prepare("SELECT COUNT(*) as count FROM products").get() as { count: number },
-    orders: db.prepare("SELECT COUNT(*) as count FROM orders").get() as { count: number },
-    items: db.prepare("SELECT COUNT(*) as count FROM order_items").get() as { count: number },
+    customers: (db.prepare("SELECT COUNT(*) as count FROM customers").get() as { count: number }).count,
+    products: (db.prepare("SELECT COUNT(*) as count FROM products").get() as { count: number }).count,
+    orders: (db.prepare("SELECT COUNT(*) as count FROM orders").get() as { count: number }).count,
+    items: (db.prepare("SELECT COUNT(*) as count FROM order_items").get() as { count: number }).count,
   };
 
   console.log("\n── Database Summary ──");
-  console.log(`  Customers:   ${counts.customers.count}`);
-  console.log(`  Products:    ${counts.products.count}`);
-  console.log(`  Orders:      ${counts.orders.count}`);
-  console.log(`  Order Items: ${counts.items.count}`);
-
-  // Show status distribution
-  const statusDist = db.prepare(
-    "SELECT status, COUNT(*) as count FROM orders GROUP BY status ORDER BY count DESC"
-  ).all() as { status: string; count: number }[];
-  console.log("\n── Order Status Distribution ──");
-  for (const row of statusDist) {
-    console.log(`  ${row.status.padEnd(12)} ${row.count}`);
-  }
-
-  // Show a sample order
-  const sampleOrder = db.prepare("SELECT * FROM orders LIMIT 1").get() as OrderRow;
-  const sampleItems = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(sampleOrder.id);
-  console.log("\n── Sample Order ──");
-  console.log(`  ${JSON.stringify(sampleOrder, null, 2)}`);
-  console.log(`  Items: ${JSON.stringify(sampleItems, null, 2)}`);
+  console.log(`  Customers:   ${counts.customers}`);
+  console.log(`  Products:    ${counts.products}`);
+  console.log(`  Orders:      ${counts.orders}`);
+  console.log(`  Order Items: ${counts.items}`);
 
   closeDb();
   console.log("\nDone! Database seeded successfully.");

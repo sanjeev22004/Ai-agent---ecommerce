@@ -2,12 +2,10 @@
  * Entry point — starts the Express API server.
  *
  * Wires together:
- *   - Express API with POST /chat endpoint
- *   - MCP server (created but transport is optional — the orchestrator
- *     calls tools directly, MCP server is for external clients)
+ *   - Express API with POST /chat and GET /traces endpoints
+ *   - Genuine Model Context Protocol (MCP) Server & Client integration
  *   - SQLite database (auto-seeds if empty)
- *
- * Run with: npm run dev (tsx watch) or npm start (compiled)
+ *   - Observability & execution trace recorder
  */
 
 import express from "express";
@@ -15,7 +13,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
 import { chatRouter } from "./api/chat.js";
-import { createMcpServer } from "./server.js";
+import { getAgentMcpClient } from "./agent/mcp-client.js";
+import { Tracer } from "./agent/tracer.js";
+import { SessionStore } from "./agent/session.js";
 import { getDb } from "./db/connection.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,9 +42,14 @@ async function main(): Promise<void> {
     console.log(`[DB] SQLite connected — ${orderCount} orders in database`);
   }
 
-  // ─── MCP Server ──────────────────────────────────────────────────────────
-  const mcpServer = createMcpServer();
-  console.log("[MCP] Server created with 4 tools: order_lookup, inventory_check, policy_search, response_draft");
+  // ─── MCP Client & Server Connection ──────────────────────────────────────
+  console.log("[MCP] Initializing Model Context Protocol Client & Server...");
+  const mcpClient = await getAgentMcpClient();
+  const discoveredTools = await mcpClient.listTools();
+  console.log(
+    `[MCP] Connected! Discovered ${discoveredTools.length} tool(s) via protocol:`,
+    discoveredTools.map((t) => t.name).join(", ")
+  );
 
   // ─── Express API ─────────────────────────────────────────────────────────
   const app = express();
@@ -55,6 +60,11 @@ async function main(): Promise<void> {
     res.json({
       status: "healthy",
       service: "ecommerce-support-copilot",
+      mcp: {
+        connected: true,
+        transport: "InMemoryTransport",
+        toolsCount: discoveredTools.length,
+      },
       llm: {
         provider: config.llm.provider,
         model: config.llm.model,
@@ -69,12 +79,28 @@ async function main(): Promise<void> {
     });
   });
 
+  // Observability & traces endpoint
+  app.get("/traces", (req, res) => {
+    const limit = parseInt(req.query.limit as string, 10) || 20;
+    res.json({
+      traces: Tracer.getRecentTraces(limit),
+    });
+  });
+
+  // Session inspection endpoint
+  app.get("/sessions/:id", (req, res) => {
+    const session = SessionStore.get(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    res.json(session);
+  });
+
   // Chat endpoint
   app.use(chatRouter);
 
   // Serve static frontend
-  // Use process.cwd() — works in both local dev (cwd = mcp-server/) and
-  // Docker (WORKDIR = /app). __dirname with tsx/ESM can resolve unexpectedly.
   const publicDir = path.join(process.cwd(), "public");
   console.log(`[Static] Serving frontend from ${publicDir}`);
   app.use(express.static(publicDir));
@@ -91,11 +117,8 @@ async function main(): Promise<void> {
     console.log(`\n── Endpoints ──`);
     console.log(`  GET  /          — Brutalist chat UI`);
     console.log(`  POST /chat     — Send a customer support message`);
-    console.log(`  GET  /health   — Health check + config info`);
-    console.log(`\n── Example ──`);
-    console.log(`  curl -X POST http://localhost:${config.server.port}/chat \\`);
-    console.log(`    -H "Content-Type: application/json" \\`);
-    console.log(`    -d '{"message": "Where is my order ORD-1001?"}'`);
+    console.log(`  GET  /traces   — Execution traces, token & cost observations`);
+    console.log(`  GET  /health   — Health check + MCP config info`);
     console.log("");
   });
 }

@@ -1,17 +1,12 @@
 /**
  * Agent Orchestrator — the "brain" of the support copilot.
  *
- * Flow:
- *   1. Receive user message + conversation history
- *   2. Send to LLM with system prompt + tool definitions
- *   3. If LLM returns tool_calls → execute them, append results, loop back to 2
- *   4. If LLM returns a text response → return it as the final answer
- *
- * The LLM decides which tools to call based on the user's message and the
- * tool descriptions. This is NOT if/else routing — it's LLM-driven delegation.
- *
- * Tools are called directly (not through MCP protocol) since the agent
- * and tools live in the same process. The MCP server exists for external clients.
+ * Implements genuine Model Context Protocol (MCP) integration:
+ * - Discovers available tools dynamically via MCP Client protocol (tools/list)
+ * - Converts MCP schemas into LLM function specifications
+ * - Executes tool calls over MCP protocol (tools/call)
+ * - Tracks per-step execution traces (latency, token usage, cost)
+ * - Manages stateful sessions
  */
 
 import OpenAI from "openai";
@@ -20,208 +15,73 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions.js";
 import { config } from "../config.js";
-import type { OrderStatus, ProductCategory } from "../db/models.js";
-import { orderLookup } from "../tools/order-lookup.js";
-import { inventoryCheck } from "../tools/inventory-check.js";
-import { policySearch } from "../tools/policy-search.js";
+import { getAgentMcpClient } from "./mcp-client.js";
+import { SessionStore, type SessionState, type ConversationMessage } from "./session.js";
+import { Tracer, type ExecutionTrace } from "./tracer.js";
 import { ORCHESTRATOR_SYSTEM_PROMPT } from "./prompts.js";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-export interface ConversationMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
-export interface OrchestratorResult {
-  response: string;
-  toolCalls: ToolCallRecord[];
-}
+export { ConversationMessage };
 
 export interface ToolCallRecord {
   tool: string;
   args: Record<string, unknown>;
   result: string;
+  isError?: boolean;
+  durationMs?: number;
 }
 
-// ─── Tool Definitions (OpenAI function calling format) ───────────────────────
-
-const TOOLS: ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "order_lookup",
-      description:
-        "Look up order details by order ID, customer email, or order status. " +
-        "Returns full order information including line items, tracking number, " +
-        "and estimated delivery date.",
-      parameters: {
-        type: "object",
-        properties: {
-          order_id: {
-            type: "string",
-            description: "Order ID like ORD-1001",
-          },
-          email: {
-            type: "string",
-            description: "Customer email address",
-          },
-          status: {
-            type: "string",
-            enum: [
-              "pending",
-              "processing",
-              "shipped",
-              "delivered",
-              "cancelled",
-              "returned",
-            ],
-            description: "Filter by order status",
-          },
-        },
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "inventory_check",
-      description:
-        "Check product inventory and stock levels. Search by product ID, " +
-        "product name (partial match supported), or product category.",
-      parameters: {
-        type: "object",
-        properties: {
-          product_id: {
-            type: "string",
-            description: "Product ID like PROD-001",
-          },
-          product_name: {
-            type: "string",
-            description: "Product name or partial name to search",
-          },
-          category: {
-            type: "string",
-            enum: [
-              "electronics",
-              "clothing",
-              "home_garden",
-              "sports",
-              "books",
-              "toys",
-            ],
-            description: "Product category filter",
-          },
-        },
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "policy_search",
-      description:
-        "Search company policy documents. Covers returns, shipping, " +
-        "compensation, and warranty policies. Use for questions about " +
-        "refunds, return windows, shipping times, or compensation.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description:
-              "Natural language question about policies, e.g. 'what is the return policy for electronics?'",
-          },
-        },
-        required: ["query"],
-      },
-    },
-  },
-];
-
-// NOTE: response_draft is intentionally excluded from the orchestrator's tool list.
-// The agentic loop already handles final response synthesis — when the LLM has all
-// tool results, it produces a text response (no tool_calls) and the loop exits.
-// Including response_draft caused infinite loops: the LLM would call it, see the
-// result, then call more tools instead of stopping.
-
-// ─── Tool Executor ───────────────────────────────────────────────────────────
-
-async function executeTool(
-  name: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  switch (name) {
-    case "order_lookup": {
-      const results = orderLookup({
-        order_id: args.order_id as string | undefined,
-        email: args.email as string | undefined,
-        status: args.status as OrderStatus | undefined,
-      });
-      return results.length > 0
-        ? JSON.stringify(results, null, 2)
-        : "No orders found matching the given criteria.";
-    }
-
-    case "inventory_check": {
-      const results = inventoryCheck({
-        product_id: args.product_id as string | undefined,
-        product_name: args.product_name as string | undefined,
-        category: args.category as ProductCategory | undefined,
-      });
-      return results.length > 0
-        ? JSON.stringify(results, null, 2)
-        : "No products found matching the given criteria.";
-    }
-
-    case "policy_search": {
-      const rawTopK = args.top_k;
-      const top_k = rawTopK != null ? Number(rawTopK) : undefined;
-      const results = await policySearch({
-        query: args.query as string,
-        top_k: Number.isNaN(top_k) ? undefined : top_k,
-      });
-      if (results.results.length === 0) {
-        return "No relevant policy information found.";
-      }
-      return results.results
-        .map(
-          (chunk) =>
-            `[Source: ${chunk.source}, Relevance: ${(chunk.score * 100).toFixed(1)}%]\n${chunk.text}`
-        )
-        .join("\n\n---\n\n");
-    }
-
-    default:
-      return `Unknown tool: ${name}`;
-  }
+export interface OrchestratorResult {
+  response: string;
+  toolCalls: ToolCallRecord[];
+  trace?: ExecutionTrace;
+  sessionId: string;
 }
 
-// ─── Orchestrator ────────────────────────────────────────────────────────────
-
-const MAX_ITERATIONS = 5; // Safety limit to prevent infinite loops
+const MAX_ITERATIONS = 5;
 
 /**
  * Run the agent orchestrator.
  *
- * Takes a user message and optional conversation history,
- * runs the agentic tool-calling loop, and returns the final response
- * along with a record of all tool calls made.
+ * Discovers tools dynamically via the MCP client, runs the reasoning loop,
+ * logs execution traces, and updates session state.
  */
 export async function orchestrate(
   userMessage: string,
-  conversationHistory: ConversationMessage[] = []
+  sessionOrHistory: SessionState | ConversationMessage[] = [],
+  explicitSessionId?: string
 ): Promise<OrchestratorResult> {
+  // Normalize session
+  let session: SessionState;
+  if ("sessionId" in sessionOrHistory && typeof sessionOrHistory.sessionId === "string") {
+    session = sessionOrHistory;
+  } else {
+    session = SessionStore.getOrCreate(explicitSessionId);
+    if (Array.isArray(sessionOrHistory) && sessionOrHistory.length > 0) {
+      session.history = [...sessionOrHistory];
+    }
+  }
+
+  // Initialize tracer
+  const activeTrace = Tracer.createTrace(session.sessionId, userMessage);
+
+  // Initialize MCP client & fetch dynamic tool schemas
+  const mcpClient = await getAgentMcpClient();
+  const tools: ChatCompletionTool[] = await mcpClient.getOpenAITools();
+
   const client = new OpenAI({
     baseURL: config.llm.baseUrl,
     apiKey: config.llm.apiKey,
   });
 
   // Build message history
+  const contextHeader = session.context.activeOrderId
+    ? `\nActive Context: Customer Order ID is ${session.context.activeOrderId}.`
+    : "";
+
   const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: ORCHESTRATOR_SYSTEM_PROMPT },
-    ...conversationHistory.map((msg) => ({
-      role: msg.role as "user" | "assistant",
+    { role: "system", content: ORCHESTRATOR_SYSTEM_PROMPT + contextHeader },
+    ...session.history.map((msg) => ({
+      role: msg.role as "user" | "assistant" | "system",
       content: msg.content,
     })),
     { role: "user", content: userMessage },
@@ -230,78 +90,155 @@ export async function orchestrate(
   const toolCallRecords: ToolCallRecord[] = [];
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-    const response = await client.chat.completions.create({
-      model: config.llm.model,
-      messages,
-      tools: TOOLS,
-      temperature: 0.3, // Lower temperature for more deterministic tool selection
-    });
+    const llmStartTime = Date.now();
+    let choice;
 
-    const choice = response.choices[0];
+    try {
+      const response = await client.chat.completions.create({
+        model: config.llm.model,
+        messages,
+        tools: tools.length > 0 ? tools : undefined,
+        temperature: 0.2, // Low temperature for deterministic tool calling
+      });
+
+      const llmDuration = Date.now() - llmStartTime;
+      choice = response.choices[0];
+
+      activeTrace.recordStep("llm_reasoning", config.llm.model, llmDuration, {
+        promptTokens: response.usage?.prompt_tokens,
+        completionTokens: response.usage?.completion_tokens,
+        totalTokens: response.usage?.total_tokens,
+        model: config.llm.model,
+      });
+    } catch (err) {
+      const llmDuration = Date.now() - llmStartTime;
+      const errorMsg = err instanceof Error ? err.message : "LLM API error";
+      console.error("[Orchestrator] LLM completion failed:", errorMsg);
+
+      activeTrace.recordStep("llm_reasoning", config.llm.model, llmDuration, {
+        isError: true,
+        output: errorMsg,
+      });
+
+      const finalTrace = activeTrace.finalize(
+        "I encountered a temporary service issue connecting to the AI model. Please try again shortly.",
+        config.llm.model,
+        "error"
+      );
+
+      return {
+        response:
+          "I apologize, but our automated resolution service is temporarily degraded. Please try again in a few moments or contact support@example.com.",
+        toolCalls: toolCallRecords,
+        trace: finalTrace,
+        sessionId: session.sessionId,
+      };
+    }
+
     if (!choice) {
+      const finalTrace = activeTrace.finalize(
+        "No response generated from LLM",
+        config.llm.model,
+        "error"
+      );
       return {
         response: "I'm sorry, I wasn't able to process your request.",
         toolCalls: toolCallRecords,
+        trace: finalTrace,
+        sessionId: session.sessionId,
       };
     }
 
     const assistantMessage = choice.message;
 
-    // If the LLM wants to call tools
+    // Handle MCP Tool Calls
     if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
-      // Add assistant message with tool calls to history
       messages.push(assistantMessage);
 
-      // Execute each tool call
       for (const toolCall of assistantMessage.tool_calls) {
-        const args = JSON.parse(toolCall.function.arguments) as Record<
-          string,
-          unknown
-        >;
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(toolCall.function.arguments || "{}");
+        } catch {
+          args = {};
+        }
 
         console.log(
-          `  [Tool] ${toolCall.function.name}(${JSON.stringify(args)})`
+          `  [MCP Tool Call] ${toolCall.function.name}(${JSON.stringify(args)})`
         );
 
-        const result = await executeTool(toolCall.function.name, args);
+        // Track context if user provided order_id
+        if (typeof args.order_id === "string") {
+          SessionStore.updateContext(session.sessionId, {
+            activeOrderId: args.order_id,
+          });
+        }
 
-        // Record the tool call
+        const toolStartTime = Date.now();
+        // Invoke via the MCP Client protocol boundary
+        const mcpResult = await mcpClient.callTool(toolCall.function.name, args);
+        const toolDuration = Date.now() - toolStartTime;
+
+        activeTrace.recordStep("mcp_tool_call", toolCall.function.name, toolDuration, {
+          input: args,
+          output: mcpResult.content.slice(0, 500),
+          isError: mcpResult.isError,
+        });
+
         toolCallRecords.push({
           tool: toolCall.function.name,
           args,
           result:
-            result.length > 500
-              ? result.substring(0, 500) + "... (truncated)"
-              : result,
+            mcpResult.content.length > 500
+              ? mcpResult.content.substring(0, 500) + "... (truncated)"
+              : mcpResult.content,
+          isError: mcpResult.isError,
+          durationMs: toolDuration,
         });
 
-        // Add tool result to message history
+        // Append tool result into LLM message history
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: result,
+          content: mcpResult.content,
         });
       }
 
-      // Loop back — the LLM will see the tool results and either
-      // call more tools or produce a final response
+      // Continue loop for LLM to reason over tool output or call additional dependent tools
       continue;
     }
 
-    // No tool calls — this is the final response
+    // No tool calls — final response generated
+    const finalAnswer =
+      assistantMessage.content || "I'm sorry, I wasn't able to generate a response.";
+
+    // Update conversation session history
+    session.history.push({ role: "user", content: userMessage });
+    session.history.push({ role: "assistant", content: finalAnswer });
+
+    const finalTrace = activeTrace.finalize(finalAnswer, config.llm.model, "success");
+
     return {
-      response:
-        assistantMessage.content ||
-        "I'm sorry, I wasn't able to generate a response.",
+      response: finalAnswer,
       toolCalls: toolCallRecords,
+      trace: finalTrace,
+      sessionId: session.sessionId,
     };
   }
 
-  // Hit max iterations — return what we have
+  // Hit iteration limit
+  const maxLimitMsg =
+    "I gathered the relevant details but reached my single-turn processing limit. Please confirm if you would like me to proceed with the next step.";
+  const finalTrace = activeTrace.finalize(
+    maxLimitMsg,
+    config.llm.model,
+    "max_iterations_reached"
+  );
+
   return {
-    response:
-      "I gathered some information but reached my processing limit. " +
-      "Please try a more specific question.",
+    response: maxLimitMsg,
     toolCalls: toolCallRecords,
+    trace: finalTrace,
+    sessionId: session.sessionId,
   };
 }

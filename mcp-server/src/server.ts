@@ -22,7 +22,7 @@ import { responseDraft } from "./tools/response-draft.js";
 export function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "ecommerce-support-tools",
-    version: "1.0.0",
+    version: "2.0.0",
   });
 
   // ─── order_lookup ────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "policy_search",
-    "Search company policy documents using semantic similarity. " +
+    "Search company policy documents using semantic and hybrid similarity. " +
       "Covers return policies, shipping policies, compensation policies, " +
       "and warranty information. Use this when a customer asks about policies, " +
       "returns, refunds, warranties, shipping times, or compensation for issues.",
@@ -125,9 +125,13 @@ export function createMcpServer(): McpServer {
         .max(10)
         .optional()
         .describe("Number of relevant policy chunks to return (default 3)"),
+      method: z
+        .enum(["dense", "bm25", "hybrid"])
+        .optional()
+        .describe("Retrieval method: dense (semantic), bm25 (keyword), or hybrid (RRF fusion)"),
     },
-    async ({ query, top_k }) => {
-      const results = await policySearch({ query, top_k });
+    async ({ query, top_k, method }) => {
+      const results = await policySearch({ query, top_k, method });
 
       if (results.results.length === 0) {
         return {
@@ -143,8 +147,8 @@ export function createMcpServer(): McpServer {
       // Format chunks for the LLM — include source and score for context
       const formatted = results.results
         .map(
-          (chunk, i) =>
-            `[Source: ${chunk.source}, Relevance: ${(chunk.score * 100).toFixed(1)}%]\n${chunk.text}`
+          (chunk) =>
+            `[Source: ${chunk.source}, Score: ${(chunk.score * 100).toFixed(1)}%]\n${chunk.text}`
         )
         .join("\n\n---\n\n");
 

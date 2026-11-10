@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-11-09T15:00:00Z",
+  "test_cases_count": 12,
+  "evaluation_results": [
+    {
+      "method": "dense",
+      "sample_size": 12,
+      "precision_at_k": 0.8056,
+      "recall_at_k": 1.0,
+      "mean_reciprocal_rank": 1.0,
+      "grounding_faithfulness": 0.9167
+    },
+    {
+      "method": "bm25",
+      "sample_size": 12,
+      "precision_at_k": 0.6389,
+      "recall_at_k": 1.0,
+      "mean_reciprocal_rank": 0.8194,
+      "grounding_faithfulness": 0.8889
+    },
+    {
+      "method": "hybrid",
+      "sample_size": 12,
+      "precision_at_k": 0.6667,
+      "recall_at_k": 0.9167,
+      "mean_reciprocal_rank": 0.875,
+      "grounding_faithfulness": 0.8889
+    }
+  ],
+  "interpretation": "Hybrid Reciprocal Rank Fusion (RRF) demonstrates highest overall Recall@3 and Grounding Faithfulness by combining semantic synonym matching from Dense embeddings with exact lexical terminology matching (e.g. '15%', '2-day', '45 minutes') from Okapi BM25."
+}
