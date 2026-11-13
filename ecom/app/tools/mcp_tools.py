@@ -1,4 +1,4 @@
-"""Official Python MCP tool definitions with strict Pydantic input schemas.
+"""Official Python MCP tool definitions with strict dual-sided Pydantic v2 contracts.
 
 Implements transactional e-commerce lifecycle:
 1. order_lookup (with customer role scoping)
@@ -7,6 +7,9 @@ Implements transactional e-commerce lifecycle:
 4. request_return
 5. process_refund (with idempotency and $50 approval threshold)
 6. policy_search (with pgvector and date-filtering)
+7. approve_refund (admin only)
+8. reembed_policies (admin only)
+9. inspect_traces (admin only)
 """
 
 from datetime import datetime, timezone
@@ -16,136 +19,57 @@ import random
 import uuid
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
-from sqlalchemy import select, or_, and_
+from sqlalchemy import select, or_, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Order, OrderItem, Product, Return, Refund, User
+from app.contracts.tool_contracts import (
+    OrderLookupInput,
+    OrderLookupOutput,
+    OrderDetail,
+    OrderItemDetail,
+    ReturnSummary,
+    InventoryCheckInput,
+    InventoryCheckOutput,
+    ProductDetail,
+    PlaceOrderInput,
+    PlaceOrderOutput,
+    RequestReturnInput,
+    RequestReturnOutput,
+    ProcessRefundInput,
+    ProcessRefundOutput,
+    PolicySearchInput,
+    PolicySearchOutput,
+    PolicyChunkResult,
+    ApproveRefundInput,
+    ApproveRefundOutput,
+    ReembedPoliciesInput,
+    ReembedPoliciesOutput,
+    InspectTracesInput,
+    InspectTracesOutput,
+)
+from app.db.models import Order, OrderItem, Product, Return, Refund, User, ExecutionTrace
 from app.rag.retriever import search_policies
+from app.rag.ingest import ingest_policies
 
-# Official Python MCP MCPServer
+logger = logging.getLogger(__name__)
+
+# Optional MCPServer integration
 try:
     from mcp.server.mcpserver import MCPServer
     mcp_server = MCPServer("ecom-support")
 except Exception:
     mcp_server = None
 
-logger = logging.getLogger(__name__)
 
-
-# ─── Pydantic Schemas ────────────────────────────────────────────────────────
-
-class OrderLookupInput(BaseModel):
-    order_id: Optional[str] = Field(None, description="Order ID (e.g., 'ORD-1001')")
-    email: Optional[str] = Field(None, description="Customer email address")
-    status: Optional[str] = Field(
-        None,
-        description="Filter by order status: 'pending', 'processing', 'shipped', 'delivered', 'returned', 'cancelled'",
-    )
-
-
-class InventoryCheckInput(BaseModel):
-    name: Optional[str] = Field(None, description="Product name or keyword (e.g., 'Headphones', 'Webcam')")
-    id: Optional[str] = Field(None, description="Product ID (e.g., 'PROD-001')")
-    category: Optional[str] = Field(
-        None,
-        description="Product category ('electronics', 'clothing', 'home_garden', 'sports', 'books', 'toys')",
-    )
-
-
-class OrderItemInput(BaseModel):
-    product_id: str = Field(..., description="Product ID (e.g. 'PROD-001')")
-    quantity: int = Field(..., gt=0, description="Quantity to purchase")
-
-
-class PlaceOrderInput(BaseModel):
-    customer_email: str = Field(..., description="Customer's email address")
-    items: List[OrderItemInput] = Field(..., min_length=1, description="List of items with product_id and quantity")
-
-
-class RequestReturnInput(BaseModel):
-    order_id: str = Field(..., description="Order ID to return (must be in 'delivered' status)")
-    product_id: str = Field(..., description="Product ID to return")
-    reason: str = Field(..., min_length=3, description="Reason for return request")
-
-
-class ProcessRefundInput(BaseModel):
-    order_id: str = Field(..., description="Associated Order ID (e.g. 'ORD-1001')")
-    rma_code: str = Field(..., description="Approved Return authorization code (e.g. 'RMA-9021')")
-    amount: float = Field(..., gt=0, description="Refund amount in USD")
-    idempotency_key: str = Field(..., min_length=8, description="Unique client idempotency key to prevent double refunds")
-
-
-class PolicySearchInput(BaseModel):
-    query: str = Field(..., description="Policy question or search keywords")
-    top_k: int = Field(3, description="Maximum number of policy sections to retrieve")
-    order_date: Optional[str] = Field(None, description="Order purchase date to filter applicable policies")
-
-
-# ─── OpenAI Tool Specifications ───────────────────────────────────────────────
-
-OPENAI_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "order_lookup",
-            "description": "Look up existing order status, delivery date, line items, and tracking number by order_id, email, or status.",
-            "parameters": OrderLookupInput.model_json_schema(),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "inventory_check",
-            "description": "Check current stock level, unit price, category, and warranty duration for products in the catalog.",
-            "parameters": InventoryCheckInput.model_json_schema(),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "place_order",
-            "description": "Place a new customer order. Validates inventory, decrements stock, and creates order records.",
-            "parameters": PlaceOrderInput.model_json_schema(),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "request_return",
-            "description": "Initiate a product return request. Verifies order is 'delivered' and generates an official RMA tracking code.",
-            "parameters": RequestReturnInput.model_json_schema(),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "process_refund",
-            "description": "Process a monetary refund for an RMA return. Auto-approves under $50; requires admin review if > $50.",
-            "parameters": ProcessRefundInput.model_json_schema(),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "policy_search",
-            "description": "Search return, shipping, compensation, and warranty policies using semantic vector search with date filtering.",
-            "parameters": PolicySearchInput.model_json_schema(),
-        },
-    },
-]
-
-
-# ─── Tool Implementations ─────────────────────────────────────────────────────
+# ─── 1. Order Lookup Tool ─────────────────────────────────────────────────────
 
 async def tool_order_lookup(
     session: AsyncSession,
     current_user: Optional[User],
     params: OrderLookupInput,
 ) -> Dict[str, Any]:
-    """Execute order lookup with customer security scoping."""
-    # Build query
+    """Execute order lookup with customer security scoping and Pydantic v2 output validation."""
     stmt = select(Order).options(selectinload(Order.items), selectinload(Order.returns))
     conditions = []
 
@@ -154,10 +78,13 @@ async def tool_order_lookup(
         conditions.append(Order.customer_email == current_user.email)
         # If user explicitly asked for a different email, deny
         if params.email and params.email.lower().strip() != current_user.email.lower():
-            return {
-                "error": "Access Denied: Customers can only query orders associated with their own verified email address.",
+            raw_err = {
+                "success": False,
+                "count": 0,
                 "orders": [],
+                "error": "Access Denied: Customers can only query orders associated with their own verified email address.",
             }
+            return OrderLookupOutput.model_validate(raw_err).model_dump()
     elif params.email:
         conditions.append(Order.customer_email.ilike(f"%{params.email.strip()}%"))
 
@@ -168,56 +95,74 @@ async def tool_order_lookup(
         conditions.append(Order.status == params.status.strip().lower())
 
     if not conditions:
-        return {
-            "error": "Please provide an order_id, customer email, or status to search orders.",
+        raw_err = {
+            "success": False,
+            "count": 0,
             "orders": [],
+            "error": "Please provide an order_id, customer email, or status to search orders.",
         }
+        return OrderLookupOutput.model_validate(raw_err).model_dump()
 
     stmt = stmt.where(and_(*conditions)).order_by(Order.created_at.desc()).limit(10)
     result = await session.execute(stmt)
     orders = result.scalars().all()
 
     if not orders:
-        return {
-            "message": "No orders found matching the specified search criteria.",
+        raw_empty = {
+            "success": True,
+            "count": 0,
             "orders": [],
+            "message": "No orders found matching the specified search criteria.",
         }
+        return OrderLookupOutput.model_validate(raw_empty).model_dump()
 
     output = []
     for o in orders:
         items_summary = [
-            {
-                "product_id": item.product_id,
-                "product_name": item.product_name,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-            }
+            OrderItemDetail(
+                product_id=item.product_id,
+                product_name=item.product_name,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                net_amount=getattr(item, "net_amount", None) or (item.quantity * item.unit_price),
+            )
             for item in o.items
         ]
         returns_summary = [
-            {"rma_code": r.id, "reason": r.reason, "status": r.status}
+            ReturnSummary(rma_code=r.id, reason=r.reason, status=r.status)
             for r in o.returns
         ]
-        output.append({
-            "order_id": o.id,
-            "customer_email": o.customer_email,
-            "status": o.status,
-            "total_amount": o.total_amount,
-            "tracking_number": o.tracking_number,
-            "delivery_date": o.delivery_date.isoformat() if o.delivery_date else None,
-            "created_at": o.created_at.isoformat() if o.created_at else None,
-            "items": items_summary,
-            "returns": returns_summary,
-        })
+        output.append(
+            OrderDetail(
+                order_id=o.id,
+                customer_email=o.customer_email,
+                status=o.status,
+                total_amount=o.total_amount,
+                tracking_number=o.tracking_number,
+                delivery_date=o.delivery_date.isoformat() if o.delivery_date else None,
+                created_at=o.created_at.isoformat() if o.created_at else None,
+                items=items_summary,
+                returns=returns_summary,
+            )
+        )
 
-    return {"count": len(output), "orders": output}
+    raw_success = {
+        "success": True,
+        "count": len(output),
+        "orders": output,
+        "message": f"Successfully retrieved {len(output)} order(s).",
+    }
+    validated = OrderLookupOutput.model_validate(raw_success)
+    return validated.model_dump()
 
+
+# ─── 2. Inventory Check Tool ──────────────────────────────────────────────────
 
 async def tool_inventory_check(
     session: AsyncSession,
     params: InventoryCheckInput,
 ) -> Dict[str, Any]:
-    """Execute product catalog inventory and warranty search."""
+    """Execute product catalog inventory search with Pydantic v2 output validation."""
     stmt = select(Product)
     conditions = []
 
@@ -236,45 +181,68 @@ async def tool_inventory_check(
     products = result.scalars().all()
 
     if not products:
-        return {"message": "No matching products found in catalog.", "products": []}
+        raw_empty = {
+            "success": True,
+            "count": 0,
+            "products": [],
+            "message": "No matching products found in catalog.",
+        }
+        return InventoryCheckOutput.model_validate(raw_empty).model_dump()
 
     output = [
-        {
-            "product_id": p.id,
-            "name": p.name,
-            "category": p.category,
-            "price": p.price,
-            "stock_quantity": p.stock_quantity,
-            "in_stock": p.stock_quantity > 0,
-            "warranty_months": p.warranty_months,
-            "description": p.description,
-        }
+        ProductDetail(
+            product_id=p.id,
+            name=p.name,
+            category=p.category,
+            price=p.price,
+            stock_quantity=p.stock_quantity,
+            in_stock=p.stock_quantity > 0,
+            warranty_months=p.warranty_months,
+            description=p.description,
+        )
         for p in products
     ]
-    return {"count": len(output), "products": output}
+    raw_success = {
+        "success": True,
+        "count": len(output),
+        "products": output,
+        "message": f"Found {len(output)} matching product(s).",
+    }
+    validated = InventoryCheckOutput.model_validate(raw_success)
+    return validated.model_dump()
 
+
+# ─── 3. Place Order Tool ──────────────────────────────────────────────────────
 
 async def tool_place_order(
     session: AsyncSession,
     current_user: Optional[User],
     params: PlaceOrderInput,
 ) -> Dict[str, Any]:
-    """Place a new customer order with inventory validation and stock decrement."""
+    """Place a new customer order with inventory validation and Pydantic v2 contract."""
     target_email = params.customer_email.strip().lower()
 
     # Customer scoping check
     if current_user and current_user.role == "customer":
         if target_email != current_user.email.lower():
-            return {"error": "Customers cannot place orders under a different email address."}
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": "Customers cannot place orders under a different email address.",
+            }
+            return PlaceOrderOutput.model_validate(raw_err).model_dump()
         user = current_user
     else:
-        # Admin or system placement
         res = await session.execute(select(User).where(User.email == target_email))
         user = res.scalar_one_or_none()
         if not user:
-            return {"error": f"No registered customer account found for email: {target_email}."}
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": f"No registered customer account found for email: {target_email}.",
+            }
+            return PlaceOrderOutput.model_validate(raw_err).model_dump()
 
-    # Validate all items
     total_amount = 0.0
     items_to_create = []
 
@@ -282,12 +250,20 @@ async def tool_place_order(
         prod_res = await session.execute(select(Product).where(Product.id == item_req.product_id.strip().upper()))
         product = prod_res.scalar_one_or_none()
         if not product:
-            return {"error": f"Product '{item_req.product_id}' does not exist in catalog."}
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": f"Product '{item_req.product_id}' does not exist in catalog.",
+            }
+            return PlaceOrderOutput.model_validate(raw_err).model_dump()
 
         if product.stock_quantity < item_req.quantity:
-            return {
-                "error": f"Insufficient stock for '{product.name}' ({product.id}). Available: {product.stock_quantity}, Requested: {item_req.quantity}."
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": f"Insufficient stock for '{product.name}' ({product.id}). Available: {product.stock_quantity}, Requested: {item_req.quantity}.",
             }
+            return PlaceOrderOutput.model_validate(raw_err).model_dump()
 
         # Decrement inventory
         product.stock_quantity -= item_req.quantity
@@ -321,7 +297,7 @@ async def tool_place_order(
     await session.flush()
 
     for item_data in items_to_create:
-        line_id = f"OL-{uuid.uuid4().hex[:10].upper()}" if 'uuid' in dir() else f"OL-{random.randint(10000000, 99999999)}"
+        line_id = f"OL-{uuid.uuid4().hex[:10].upper()}"
         line_net = round(item_data["quantity"] * item_data["unit_price"], 2)
         order_item = OrderItem(
             id=line_id,
@@ -336,7 +312,8 @@ async def tool_place_order(
 
     await session.commit()
 
-    return {
+    raw_success = {
+        "success": True,
         "status": "success",
         "order_id": order_id,
         "customer_email": user.email,
@@ -346,7 +323,10 @@ async def tool_place_order(
         "items_count": len(items_to_create),
         "message": f"Order {order_id} placed successfully. Warehouse status: processing.",
     }
+    return PlaceOrderOutput.model_validate(raw_success).model_dump()
 
+
+# ─── 4. Request Return Tool ───────────────────────────────────────────────────
 
 async def tool_request_return(
     session: AsyncSession,
@@ -362,26 +342,41 @@ async def tool_request_return(
     order = order_res.scalar_one_or_none()
 
     if not order:
-        return {"error": f"Order '{params.order_id}' was not found in our system."}
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"Order '{params.order_id}' was not found in our system.",
+        }
+        return RequestReturnOutput.model_validate(raw_err).model_dump()
 
     # Ownership check
     if current_user and current_user.role == "customer":
         if order.customer_email.lower() != current_user.email.lower():
-            return {"error": "Access Denied: You cannot request returns for orders belonging to another customer."}
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": "Access Denied: You cannot request returns for orders belonging to another customer.",
+            }
+            return RequestReturnOutput.model_validate(raw_err).model_dump()
 
     # State validation: must be 'delivered'
     if order.status.lower() != "delivered":
-        return {
-            "error": f"Cannot return order '{order.id}'. Returns are only permitted for delivered orders. Current order status: '{order.status}'."
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"Cannot return order '{order.id}'. Returns are only permitted for delivered orders. Current order status: '{order.status}'.",
         }
+        return RequestReturnOutput.model_validate(raw_err).model_dump()
 
-    # Verify product is part of order
     product_in_order = any(item.product_id == params.product_id.strip().upper() for item in order.items)
     if not product_in_order:
         valid_items = [f"{item.product_id} ({item.product_name})" for item in order.items]
-        return {
-            "error": f"Product '{params.product_id}' is not in order '{order.id}'. Valid items in this order: {', '.join(valid_items)}."
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"Product '{params.product_id}' is not in order '{order.id}'. Valid items in this order: {', '.join(valid_items)}.",
         }
+        return RequestReturnOutput.model_validate(raw_err).model_dump()
 
     rma_code = f"RMA-{random.randint(1000, 9999)}"
     return_record = Return(
@@ -395,7 +390,8 @@ async def tool_request_return(
     session.add(return_record)
     await session.commit()
 
-    return {
+    raw_success = {
+        "success": True,
         "status": "success",
         "rma_code": rma_code,
         "order_id": order.id,
@@ -403,7 +399,10 @@ async def tool_request_return(
         "return_status": "requested",
         "message": f"Return request initiated successfully with authorization code {rma_code}. You may print a prepaid label or proceed to refund evaluation.",
     }
+    return RequestReturnOutput.model_validate(raw_success).model_dump()
 
+
+# ─── 5. Process Refund Tool ───────────────────────────────────────────────────
 
 async def tool_process_refund(
     session: AsyncSession,
@@ -411,42 +410,60 @@ async def tool_process_refund(
     params: ProcessRefundInput,
 ) -> Dict[str, Any]:
     """Process a refund with idempotency protection and a $50 admin approval limit."""
-    # 1. Guardrail: Idempotency check to prevent duplicate refunds
+    # 1. Idempotency check
     existing_refund_res = await session.execute(
         select(Refund).where(Refund.idempotency_key == params.idempotency_key.strip())
     )
     existing_refund = existing_refund_res.scalar_one_or_none()
     if existing_refund:
-        return {
+        raw_idem = {
+            "success": True,
             "status": "idempotent_duplicate",
             "refund_id": existing_refund.id,
-            "refund_status": existing_refund.status,
+            "rma_code": existing_refund.return_id,
+            "order_id": existing_refund.order_id,
             "amount": existing_refund.amount,
+            "refund_status": existing_refund.status,
+            "requires_admin_approval": existing_refund.status == "pending_admin_approval",
             "message": f"Refund with idempotency key '{params.idempotency_key}' was already processed with status '{existing_refund.status}'. Duplicate transaction prevented.",
         }
+        return ProcessRefundOutput.model_validate(raw_idem).model_dump()
 
     # 2. Validate Order & Return
     order_res = await session.execute(select(Order).where(Order.id == params.order_id.strip().upper()))
     order = order_res.scalar_one_or_none()
     if not order:
-        return {"error": f"Order '{params.order_id}' was not found."}
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"Order '{params.order_id}' was not found.",
+        }
+        return ProcessRefundOutput.model_validate(raw_err).model_dump()
 
     return_res = await session.execute(select(Return).where(Return.id == params.rma_code.strip().upper()))
     return_record = return_res.scalar_one_or_none()
     if not return_record or return_record.order_id != order.id:
-        return {
-            "error": f"No valid return request matching RMA code '{params.rma_code}' for order '{order.id}'. Please initiate a return request first."
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"No valid return request matching RMA code '{params.rma_code}' for order '{order.id}'. Please initiate a return request first.",
         }
+        return ProcessRefundOutput.model_validate(raw_err).model_dump()
 
     # Ownership check
     if current_user and current_user.role == "customer":
         if order.customer_email.lower() != current_user.email.lower():
-            return {"error": "Access Denied: You cannot process refunds for another customer's order."}
+            raw_err = {
+                "success": False,
+                "status": "error",
+                "error": "Access Denied: You cannot process refunds for another customer's order.",
+            }
+            return ProcessRefundOutput.model_validate(raw_err).model_dump()
 
     refund_id = f"REF-{random.randint(1000, 9999)}"
     amount = round(params.amount, 2)
 
-    # 3. Guardrail: Threshold check ($50 limit)
+    # Threshold check ($50 limit)
     if amount <= 50.0:
         refund_status = "completed"
         order.status = "returned"
@@ -468,7 +485,8 @@ async def tool_process_refund(
     session.add(refund_obj)
     await session.commit()
 
-    return {
+    raw_success = {
+        "success": True,
         "status": "success",
         "refund_id": refund_id,
         "rma_code": return_record.id,
@@ -478,7 +496,10 @@ async def tool_process_refund(
         "requires_admin_approval": refund_status == "pending_admin_approval",
         "message": message,
     }
+    return ProcessRefundOutput.model_validate(raw_success).model_dump()
 
+
+# ─── 6. Policy Search Tool ────────────────────────────────────────────────────
 
 async def tool_policy_search(
     session: AsyncSession,
@@ -492,20 +513,134 @@ async def tool_policy_search(
         order_date=params.order_date,
     )
     if not results:
-        return {
-            "message": "No relevant policies found matching the query.",
+        raw_empty = {
+            "success": True,
+            "count": 0,
+            "query": params.query,
+            "order_date_filtered": params.order_date,
             "results": [],
+            "message": "No relevant policies found matching the query.",
         }
+        return PolicySearchOutput.model_validate(raw_empty).model_dump()
 
-    return {
-        "count": len(results),
+    formatted_results = [
+        PolicyChunkResult(
+            title=r.get("title", "Policy Section"),
+            chunk_index=r.get("chunk_index", 0),
+            content=r.get("content", ""),
+            score=float(r.get("score", 0.0)),
+            category=r.get("category"),
+        )
+        for r in results
+    ]
+
+    raw_success = {
+        "success": True,
+        "count": len(formatted_results),
         "query": params.query,
         "order_date_filtered": params.order_date,
-        "results": results,
+        "results": formatted_results,
+        "message": f"Retrieved {len(formatted_results)} relevant policy section(s).",
     }
+    return PolicySearchOutput.model_validate(raw_success).model_dump()
 
 
-# ─── Tool Router ──────────────────────────────────────────────────────────────
+# ─── 7. Admin Tools ───────────────────────────────────────────────────────────
+
+async def tool_approve_refund(
+    session: AsyncSession,
+    current_user: Optional[User],
+    params: ApproveRefundInput,
+) -> Dict[str, Any]:
+    """Admin tool: Approve a pending refund."""
+    ref_res = await session.execute(
+        select(Refund)
+        .options(selectinload(Refund.order), selectinload(Refund.return_req))
+        .where(Refund.id == params.refund_id.strip().upper())
+    )
+    refund = ref_res.scalar_one_or_none()
+    if not refund:
+        raw_err = {
+            "success": False,
+            "status": "error",
+            "error": f"Refund '{params.refund_id}' was not found.",
+        }
+        return ApproveRefundOutput.model_validate(raw_err).model_dump()
+
+    refund.status = "completed"
+    if refund.order:
+        refund.order.status = "returned"
+    if refund.return_req:
+        refund.return_req.status = "approved"
+
+    await session.commit()
+
+    raw_success = {
+        "success": True,
+        "status": "success",
+        "refund_id": refund.id,
+        "order_id": refund.order_id,
+        "amount": refund.amount,
+        "new_status": "completed",
+        "message": f"Refund {refund.id} approved by admin {current_user.name if current_user else 'Admin'}. Order status set to returned.",
+    }
+    return ApproveRefundOutput.model_validate(raw_success).model_dump()
+
+
+async def tool_reembed_policies(
+    session: AsyncSession,
+    params: ReembedPoliciesInput,
+) -> Dict[str, Any]:
+    """Admin tool: Trigger policy re-embedding."""
+    count = await ingest_policies(session)
+    raw_success = {
+        "success": True,
+        "total_chunks": count,
+        "message": f"Successfully re-embedded {count} policy chunks into vector storage.",
+    }
+    return ReembedPoliciesOutput.model_validate(raw_success).model_dump()
+
+
+async def tool_inspect_traces(
+    session: AsyncSession,
+    params: InspectTracesInput,
+) -> Dict[str, Any]:
+    """Admin tool: Inspect recent execution traces."""
+    stmt = select(ExecutionTrace).order_by(desc(ExecutionTrace.created_at)).limit(params.limit)
+    if params.status_filter:
+        stmt = stmt.where(ExecutionTrace.status == params.status_filter)
+
+    res = await session.execute(stmt)
+    records = res.scalars().all()
+
+    trace_list = [
+        {
+            "trace_id": t.trace_id,
+            "session_id": t.session_id,
+            "query": t.user_message,
+            "latency_ms": t.total_latency_ms,
+            "tokens": (t.prompt_tokens or 0) + (t.completion_tokens or 0),
+            "status": t.status,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
+        for t in records
+    ]
+
+    raw_success = {
+        "success": True,
+        "count": len(trace_list),
+        "traces": trace_list,
+    }
+    return InspectTracesOutput.model_validate(raw_success).model_dump()
+
+
+# ─── Tool Router with Defense-in-Depth Authorization ─────────────────────────
+
+from app.router.tool_registry import validate_tool_authorization, ALL_TOOL_DEFINITIONS
+
+# Expose OPENAI_TOOLS for legacy consumers
+OPENAI_TOOLS = list(ALL_TOOL_DEFINITIONS.values())
+
 
 async def execute_tool(
     name: str,
@@ -513,8 +648,22 @@ async def execute_tool(
     session: AsyncSession,
     current_user: Optional[User] = None,
 ) -> Dict[str, Any]:
-    """Route tool call by name with strict schema validation."""
-    logger.info("Executing tool '%s' with args: %s (User: %s)", name, args, current_user.email if current_user else "anonymous")
+    """Route and execute tool call with strict authorization and dual-sided Pydantic v2 validation."""
+    user_role = current_user.role if current_user else "customer"
+    logger.info(
+        "Executing tool '%s' with args: %s (User: %s, Role: %s)",
+        name,
+        args,
+        current_user.email if current_user else "anonymous",
+        user_role,
+    )
+
+    # Defense-in-Depth Authorization Check
+    try:
+        validate_tool_authorization(name, user_role)
+    except PermissionError as perm_err:
+        return {"error": str(perm_err), "success": False}
+
     try:
         if name == "order_lookup":
             parsed = OrderLookupInput.model_validate(args)
@@ -540,8 +689,20 @@ async def execute_tool(
             parsed = PolicySearchInput.model_validate(args)
             return await tool_policy_search(session, parsed)
 
+        elif name == "approve_refund":
+            parsed = ApproveRefundInput.model_validate(args)
+            return await tool_approve_refund(session, current_user, parsed)
+
+        elif name == "reembed_policies":
+            parsed = ReembedPoliciesInput.model_validate(args)
+            return await tool_reembed_policies(session, parsed)
+
+        elif name == "inspect_traces":
+            parsed = InspectTracesInput.model_validate(args)
+            return await tool_inspect_traces(session, parsed)
+
         else:
-            return {"error": f"Unknown tool name: '{name}'"}
+            return {"error": f"Unknown tool name: '{name}'", "success": False}
     except Exception as exc:
         logger.exception("Error executing tool '%s': %s", name, exc)
-        return {"error": f"Failed to execute {name}: {str(exc)}"}
+        return {"error": f"Failed to execute {name}: {str(exc)}", "success": False}

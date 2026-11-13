@@ -62,8 +62,18 @@ python -c "import asyncio, sys; sys.path.insert(0, 'ecom'); from app.db.seed imp
 ```
 
 ### Seeding Performance & Metrics
-- Ingestion time: **~8-9 seconds** for full database setup and vector embedding.
+- Ingestion time: **~187 seconds** for full database setup and vector embedding across 1.3+ million records:
+  - `customers`: **90,834**
+  - `order_items`: **790,734**
+  - `orders`: **342,035**
+  - `returns`: **103,036**
+  - `refunds`: **103,036**
+  - `sellers`: **4,563**
+  - `products`: **1,260**
+  - `locations`: **113**
+  - `policies`: **47**
 - Complete referential integrity enforced by foreign key constraints.
+- Native PostgreSQL `COPY` streaming used for maximum throughput.
 - Idempotent: Skips ingestion if data is already present unless `--reset` is specified.
 
 ---
@@ -82,19 +92,41 @@ python -c "import asyncio, sys; sys.path.insert(0, 'ecom'); from app.db.seed imp
 
 ---
 
-## 5. Verification & Testing
+## 5. Phase 2: Tool Contracts, Two-Tier Routing & Role Scoping
+
+### Strict Dual-Sided Pydantic v2 Contracts (`app/contracts/tool_contracts.py`)
+- Input validation: Type checking, bounds checking, string cleaning.
+- Output validation: Defense-in-depth model validation prevents corrupted internal or database data from leaking to the LLM or user.
+
+### Deterministic Intent Router (`app/router/intent_router.py`)
+- **Fast Path:** Clear, routine, read-only queries (e.g. "Where is ORD-1001?", "Is PRD-001 in stock?") execute directly against backend tools with customer scoping.
+  - Zero LLM calls (0 tokens).
+  - Measured latency: **~7.72ms median** (well below the sub-80ms target).
+- **Slow Path:** Ambiguous, multi-step, policy, return, and refund requests defer to the ReAct agent with policy search.
+
+### Dynamic Role-Based Tool Scoping & Defense-in-Depth (`app/router/tool_registry.py`)
+- **Customer sessions:** Only exposed to customer tools (`order_lookup`, `inventory_check`, `policy_search`, `place_order`, `request_return`). Admin tools (`approve_refund`, `reembed_policies`, `inspect_traces`) are omitted from LLM tool definitions.
+- **Defense-in-depth:** Even if prompt injection attempts to forge an admin tool call, the execution boundary halts execution with a permission rejection.
+
+---
+
+## 6. Verification & Testing
 
 Run all test suites:
 
 ```bash
-# Phase 1 Verification Test Suite
+# Phase 1 Verification Test Suite (Kaggle Schema & Scale)
 python ecom/test_phase1.py
 
-# End-to-End Integration Suite
-python ecom/test_ecom.py
+# Phase 2 Verification & Benchmark Test Suite (Contracts, Fast Path < 80ms, Scoping)
+python ecom/test_phase2.py
+
+# End-to-End Integration Suite (Regression & Full Lifecycle)
+python -c "import sys; sys.path.insert(0, 'ecom'); import asyncio; from test_ecom import run_tests; asyncio.run(run_tests())"
 ```
 
 ### Test Results
 - `test_phase1.py`: **4/4 Tests Passed** (Table scale, Kaggle customer auth, Admin privileges, Customer data isolation)
+- `test_phase2.py`: **5/5 Tests Passed** (Pydantic v2 contracts, 50-request benchmark at **7.72ms median**, scoping isolation, Slow Path fallback, Dynamic role scoping & defense-in-depth)
 - `test_ecom.py`: **12/12 Tests Passed** (Health, Auth, Me, Admin, Triage, Agent ReAct loop, Order Scoping, Refunds, Traces, Frontend)
 

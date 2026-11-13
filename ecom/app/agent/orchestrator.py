@@ -1,10 +1,14 @@
-"""Stateful Agent Orchestrator with ReAct loop, guardrails, and observability.
+"""Stateful Agent Orchestrator with ReAct loop, two-tier intent routing, guardrails, and observability.
 
 Implements:
-1. Off-Topic & Greeting Triage (Zero-tool direct answering)
-2. Prompt Injection Defense & Parameter Sanitization
-3. Execution Loop Guardrails (Max 5 iterations, duplicate tool prevention)
-4. Full Observability with ExecutionTrace and ChatMessage persistence in PostgreSQL
+1. Two-Tier Intent Router:
+   - FAST_PATH: Deterministic sub-80ms execution for routine order/inventory queries (Zero LLM calls).
+   - SLOW_PATH: ReAct agent for complex multi-step reasoning, returns, refunds, and policy queries.
+2. Dynamic Role-Based Tool Scoping:
+   - Exposes only authorized tools to the LLM based on authenticated user's role.
+3. Defense-in-Depth Parameter Sanitization & Injection Defense.
+4. Execution Loop Guardrails (Max 5 iterations, duplicate tool prevention).
+5. Observability with ExecutionTrace and ChatMessage persistence in PostgreSQL.
 """
 
 from datetime import datetime, timezone
@@ -19,7 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.models import ChatMessage, ChatSession, ExecutionTrace, User
-from app.tools.mcp_tools import OPENAI_TOOLS, execute_tool
+from app.tools.mcp_tools import execute_tool
+from app.router.intent_router import (
+    DeterministicIntentRouter,
+    RouteTarget,
+    execute_fast_path,
+)
+from app.router.tool_registry import get_tools_for_role
 from app.agent.prompts import (
     ORCHESTRATOR_SYSTEM_PROMPT,
     OFF_TOPIC_RESPONSE,
@@ -60,7 +70,7 @@ OFF_TOPIC_REGEX = re.compile(
 def triage_message(user_message: str) -> Optional[str]:
     """Pre-screen queries for greetings or off-topic requests.
 
-    Returns a direct string answer if detected, or None to proceed to the agent loop.
+    Returns a direct string answer if detected, or None to proceed to the router/agent.
     """
     clean_msg = user_message.strip()
 
@@ -84,7 +94,6 @@ def sanitize_parameter_value(val: Any) -> Any:
     if isinstance(val, str):
         if INJECTION_REGEX.search(val):
             logger.warning("Potential prompt injection pattern detected in parameter: %r", val)
-            # Neutralize instruction override
             return INJECTION_REGEX.sub("[BLOCKED_INJECTION_PHRASE]", val)
         return val
     elif isinstance(val, dict):
@@ -120,6 +129,7 @@ class AgentOrchestrator:
             api_key=settings.LLM_API_KEY,
         )
         self.model_name = settings.LLM_MODEL
+        self.router = DeterministicIntentRouter()
 
     async def get_or_create_session(
         self,
@@ -140,7 +150,6 @@ class AgentOrchestrator:
             if chat_sess:
                 return chat_sess
 
-        # Create fresh session
         title = first_message.strip()[:40] if first_message else "New Conversation"
         chat_sess = ChatSession(
             user_id=user.id,
@@ -159,7 +168,7 @@ class AgentOrchestrator:
         user_message: str,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute full ReAct loop with guardrails, tracing, and persistence."""
+        """Execute full request flow: Triage -> Two-Tier Router -> Fast Path or ReAct Agent."""
         chat_session = await self.get_or_create_session(
             db_session, user, session_id, first_message=user_message
         )
@@ -183,7 +192,6 @@ class AgentOrchestrator:
             step = trace.start_step("triage_direct", "Off-topic / Greeting direct response", {"query": user_message})
             step.finish(output=direct_reply)
 
-            # Persist ChatMessage
             user_msg_record = ChatMessage(
                 session_id=chat_session.id,
                 role="user",
@@ -224,7 +232,69 @@ class AgentOrchestrator:
                 "trace": final_trace,
             }
 
-        # ── 2. Build Message History ──────────────────────────────────────────
+        # ── 2. Deterministic Two-Tier Intent Router ───────────────────────────
+        decision = self.router.classify(user_message, current_user=user)
+        if decision.target == RouteTarget.FAST_PATH:
+            logger.info(
+                "Deterministic Fast-Path routed for intent '%s' (User: %s)",
+                decision.intent.value if decision.intent else "unknown",
+                user.email,
+            )
+            step = trace.start_step(
+                "fast_path_execution",
+                f"Fast-Path Dispatch: {decision.intent.value if decision.intent else 'unknown'}",
+                decision.extracted_params or {},
+            )
+            fast_reply, fast_tool_calls, elapsed_tool_ms = await execute_fast_path(
+                decision, db_session, user
+            )
+            step.finish(output={"response": fast_reply, "tool_calls": fast_tool_calls})
+
+            # Persist Chat Messages
+            user_msg_record = ChatMessage(
+                session_id=chat_session.id,
+                role="user",
+                content=user_message,
+                created_at=datetime.now(timezone.utc),
+            )
+            asst_msg_record = ChatMessage(
+                session_id=chat_session.id,
+                role="assistant",
+                content=fast_reply,
+                tool_calls_json=json.dumps(fast_tool_calls),
+                created_at=datetime.now(timezone.utc),
+            )
+            db_session.add(user_msg_record)
+            db_session.add(asst_msg_record)
+
+            final_trace = trace.finalize(fast_reply, status="fast_path_success")
+            db_trace = ExecutionTrace(
+                session_id=chat_session.id,
+                user_details=user_details_json,
+                trace_id=final_trace["trace_id"],
+                user_message=user_message,
+                final_response=fast_reply,
+                total_latency_ms=final_trace["total_latency_ms"],
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost_usd=0.0,
+                status="fast_path_success",
+                steps_json=final_trace["steps_json"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db_session.add(db_trace)
+            await db_session.commit()
+
+            return {
+                "session_id": chat_session.id,
+                "response": fast_reply,
+                "tool_calls": fast_tool_calls,
+                "trace": final_trace,
+                "fast_path": True,
+            }
+
+        # ── 3. Slow Path: ReAct Agent with Dynamic Role-Based Tool Scoping ───
+        logger.info("Routing query to Slow Path ReAct Agent (User: %s, Role: %s)", user.email, user.role)
         role_restriction = (
             "- Customer Scoping: You are scoped ONLY to orders for " + user.email +
             ". Deny requests to view, return, or refund orders for any other customer."
@@ -238,6 +308,9 @@ class AgentOrchestrator:
             user_role=user.role,
             role_restriction=role_restriction,
         )
+
+        # Dynamic Tool Scoping: Expose ONLY authorized tools to the LLM
+        role_scoped_tools = get_tools_for_role(user.role)
 
         # Retrieve last 10 session messages for context
         res_history = await db_session.execute(
@@ -253,7 +326,6 @@ class AgentOrchestrator:
             messages.append({"role": m.role, "content": m.content})
         messages.append({"role": "user", "content": user_message})
 
-        # ── 3. Stateful ReAct Loop ────────────────────────────────────────────
         executed_tool_calls: List[Dict[str, Any]] = []
         executed_signatures: set[str] = set()
         iterations = 0
@@ -271,7 +343,7 @@ class AgentOrchestrator:
                 completion = await self.client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
-                    tools=OPENAI_TOOLS,
+                    tools=role_scoped_tools,
                     tool_choice="auto",
                     temperature=0.1,
                 )
@@ -293,12 +365,10 @@ class AgentOrchestrator:
                 completion_tokens=comp_tok,
             )
 
-            # If no tools called, we have our final synthesized response
             if not response_msg.tool_calls:
                 final_text = response_msg.content or "How else can I assist you?"
                 break
 
-            # Process tool calls
             tool_calls_data = []
             for tc in response_msg.tool_calls:
                 tool_calls_data.append({
@@ -316,7 +386,6 @@ class AgentOrchestrator:
                 "tool_calls": tool_calls_data,
             })
 
-            # Execute each requested tool
             for tc in response_msg.tool_calls:
                 fn_name = tc.function.name
                 raw_args_str = tc.function.arguments or "{}"
@@ -328,7 +397,6 @@ class AgentOrchestrator:
                 norm_args = normalize_tool_arguments(fn_name, raw_args)
                 sig = f"{fn_name}:{json.dumps(norm_args, sort_keys=True)}"
 
-                # Loop Guardrail: prevent duplicate calls with same parameters
                 if sig in executed_signatures:
                     logger.warning("Loop protection: duplicate call %s skipped.", sig)
                     tool_result = {"error": f"Tool '{fn_name}' was already executed with identical parameters in this turn."}
@@ -344,26 +412,13 @@ class AgentOrchestrator:
                     "result": tool_result,
                 })
 
-                # Injection Defense: strictly inject tool response as role: "tool"
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "name": fn_name,
-                    "content": json.dumps(tool_result, ensure_ascii=False),
+                    "content": json.dumps(tool_result),
                 })
 
-        if not final_text:
-            final_text = (
-                "I have compiled the required order and policy information. "
-                "Please let me know if you would like to proceed with any further steps."
-            )
-
-        # ── 4. Observability & Persistence ────────────────────────────────────
-        final_trace = trace.finalize(
-            final_text,
-            status="success" if iterations < settings.MAX_ITERATIONS else "max_iterations_reached",
-        )
-
+        # Save to database
         user_msg_record = ChatMessage(
             session_id=chat_session.id,
             role="user",
@@ -380,6 +435,7 @@ class AgentOrchestrator:
         db_session.add(user_msg_record)
         db_session.add(asst_msg_record)
 
+        final_trace = trace.finalize(final_text, status="completed")
         db_trace = ExecutionTrace(
             session_id=chat_session.id,
             user_details=user_details_json,
@@ -395,7 +451,6 @@ class AgentOrchestrator:
             created_at=datetime.now(timezone.utc),
         )
         db_session.add(db_trace)
-        chat_session.updated_at = datetime.now(timezone.utc)
         await db_session.commit()
 
         return {
@@ -403,8 +458,9 @@ class AgentOrchestrator:
             "response": final_text,
             "tool_calls": executed_tool_calls,
             "trace": final_trace,
+            "fast_path": False,
         }
 
 
+# Singleton orchestrator instance
 orchestrator = AgentOrchestrator()
-

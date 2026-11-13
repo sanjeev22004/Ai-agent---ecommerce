@@ -11,7 +11,7 @@ STATIC_DIR = APP_DIR / "static"
 
 class Settings(BaseSettings):
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://postgres@localhost:5433/ecom"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Hrhk%404321@localhost:5432/ecom"
 
     # JWT Authentication
     JWT_SECRET: str = "ecom-super-secret-jwt-key-2026-production"

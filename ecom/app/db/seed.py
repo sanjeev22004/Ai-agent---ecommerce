@@ -1,20 +1,18 @@
 """Production Kaggle dataset ingestion & idempotent database seeder for ecom.
 
-Reads and seeds from 'Kaggle dataset archive/':
-1. DIM_LOCATION.csv -> locations
-2. DIM_PAYMENT.csv -> payment_methods
-3. DIM_FULFILLMENT.csv -> fulfillment_methods
-4. DIM_SELLER.csv -> sellers
+Reads and seeds ALL records from 'Kaggle dataset archive/':
+1. DIM_LOCATION.csv -> locations (113 rows)
+2. DIM_PAYMENT.csv -> payment_methods (14 rows)
+3. DIM_FULFILLMENT.csv -> fulfillment_methods (3 rows)
+4. DIM_SELLER.csv -> sellers (4,563 rows)
 5. DIM_PRODUCT.csv -> products (1,260 items)
-6. DIM_CUSTOMER.csv -> customers
-7. users -> credentials table (admins + Kaggle customer logins)
-8. FACT_ORDERS.csv -> orders & order_items
-9. FACT_RETURNS.csv -> returns & refunds
+6. DIM_CUSTOMER.csv -> customers (ALL 90,832 records)
+7. users -> credentials table (admins + customer logins)
+8. FACT_ORDERS.csv -> orders (ALL 342,033 orders) & order_items (ALL 790,732 lines)
+9. FACT_RETURNS.csv -> returns & refunds (ALL 103,035 records)
 10. data/policies/ -> store policies into pgvector
 
-Supports:
-- --reset: Deletes and re-creates the entire database schema from scratch.
-- Validation and import reports with row counts and integrity checks.
+High-performance bulk ingestion using native PostgreSQL COPY protocol via asyncpg.
 """
 
 import asyncio
@@ -26,23 +24,12 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+import asyncpg
+from sqlalchemy import func, select
 
 from app.auth import hash_password
-from app.db.models import (
-    Customer,
-    FulfillmentMethod,
-    Location,
-    Order,
-    OrderItem,
-    PaymentMethod,
-    Product,
-    Refund,
-    Return,
-    Seller,
-    User,
-)
+from app.config import settings
+from app.db.models import User
 from app.db.session import AsyncSessionLocal, init_db, reset_db
 from app.rag.ingest import ingest_policies
 
@@ -70,7 +57,7 @@ def parse_date(val: Optional[str]) -> Optional[datetime]:
 
 
 def derive_warranty_months(category: str, sub_cat: str) -> int:
-    """Derive sensible warranty duration by product category."""
+    """Derive warranty duration by product category."""
     cat = (category or "").lower()
     sub = (sub_cat or "").lower()
     if "electronic" in cat or "mobile" in sub or "gaming" in cat or "laptop" in sub:
@@ -84,8 +71,8 @@ def derive_warranty_months(category: str, sub_cat: str) -> int:
     return 0
 
 
-async def seed_database(reset: bool = False, force: bool = False, max_customers: int = 5000, max_orders: int = 5000) -> Dict[str, int]:
-    """Idempotently seed database from Kaggle CSV files."""
+async def seed_database(reset: bool = False, force: bool = False) -> Dict[str, int]:
+    """Idempotently seed the full Kaggle dataset into PostgreSQL using COPY bulk loading."""
     start_time = time.perf_counter()
     report: Dict[str, int] = {}
     should_reset = reset or force
@@ -96,134 +83,141 @@ async def seed_database(reset: bool = False, force: bool = False, max_customers:
     else:
         await init_db()
 
+    # Check if already seeded with full dataset
     async with AsyncSessionLocal() as session:
-        # Check if already seeded
-        existing_users = await session.scalar(select(func.count()).select_from(User))
-        if existing_users and existing_users > 0 and not reset:
-            logger.info("Database already contains %d users. Skipping full seed (use reset=True to force).", existing_users)
-            return {"users": existing_users, "status": "already_seeded"}
+        user_count = await session.scalar(select(func.count()).select_from(User))
+        if user_count and user_count > 0 and not should_reset:
+            logger.info("Database already contains %d users. Skipping full seed (use --reset to force).", user_count)
+            return {"users": user_count, "status": "already_seeded"}
 
-        logger.info("Commencing Kaggle dataset ingestion from: %s", DATASET_DIR)
+    # Connect directly with asyncpg for high-speed COPY streaming
+    raw_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    conn: asyncpg.Connection = await asyncpg.connect(raw_url)
+
+    try:
+        logger.info("Commencing Full Kaggle Dataset Ingestion from: %s", DATASET_DIR)
 
         # ── 1. DIM_LOCATION.csv ───────────────────────────────────────────────
+        t0 = time.perf_counter()
         loc_path = DATASET_DIR / "DIM_LOCATION.csv"
         location_ids: Set[str] = set()
+        loc_records = []
         if loc_path.exists():
             with open(loc_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                loc_records = []
-                for row in reader:
+                for row in csv.DictReader(f):
                     lid = row.get("location_id", "").strip()
                     if not lid:
                         continue
                     location_ids.add(lid)
-                    loc_records.append(
-                        Location(
-                            id=lid,
-                            state=row.get("state") or None,
-                            city=row.get("city") or None,
-                            postal_code=row.get("postal_code") or None,
-                            region=row.get("region") or None,
-                            latitude=float(row["latitude"]) if row.get("latitude") else None,
-                            longitude=float(row["longitude"]) if row.get("longitude") else None,
-                            area_type=row.get("area_type") or None,
-                            location_category=row.get("location_category") or None,
-                        )
-                    )
-                session.add_all(loc_records)
-                await session.flush()
-                report["locations"] = len(loc_records)
-                logger.info("Seeded %d locations.", len(loc_records))
+                    loc_records.append((
+                        lid,
+                        row.get("state") or None,
+                        row.get("city") or None,
+                        row.get("postal_code") or None,
+                        row.get("region") or None,
+                        float(row["latitude"]) if row.get("latitude") else None,
+                        float(row["longitude"]) if row.get("longitude") else None,
+                        row.get("area_type") or None,
+                        row.get("location_category") or None,
+                    ))
+            await conn.copy_records_to_table(
+                "locations",
+                records=loc_records,
+                columns=["id", "state", "city", "postal_code", "region", "latitude", "longitude", "area_type", "location_category"]
+            )
+            report["locations"] = len(loc_records)
+            logger.info("Seeded %d locations in %.2fs", len(loc_records), time.perf_counter() - t0)
 
         # ── 2. DIM_PAYMENT.csv ────────────────────────────────────────────────
+        t0 = time.perf_counter()
         pay_path = DATASET_DIR / "DIM_PAYMENT.csv"
         payment_ids: Set[str] = set()
+        pay_records = []
         if pay_path.exists():
             with open(pay_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                pay_records = []
-                for row in reader:
+                for row in csv.DictReader(f):
                     pid = row.get("payment_id", "").strip()
                     if not pid:
                         continue
                     payment_ids.add(pid)
-                    pay_records.append(
-                        PaymentMethod(
-                            id=pid,
-                            payment_method=row.get("payment_method", "Credit Card"),
-                            payment_provider=row.get("payment_provider") or None,
-                            description=row.get("description") or None,
-                        )
-                    )
-                session.add_all(pay_records)
-                await session.flush()
-                report["payment_methods"] = len(pay_records)
-                logger.info("Seeded %d payment methods.", len(pay_records))
+                    pay_records.append((
+                        pid,
+                        row.get("payment_method", "Credit Card"),
+                        row.get("payment_provider") or None,
+                        row.get("description") or None,
+                    ))
+            await conn.copy_records_to_table(
+                "payment_methods",
+                records=pay_records,
+                columns=["id", "payment_method", "payment_provider", "description"]
+            )
+            report["payment_methods"] = len(pay_records)
+            logger.info("Seeded %d payment methods in %.2fs", len(pay_records), time.perf_counter() - t0)
 
         # ── 3. DIM_FULFILLMENT.csv ────────────────────────────────────────────
+        t0 = time.perf_counter()
         ful_path = DATASET_DIR / "DIM_FULFILLMENT.csv"
         fulfillment_ids: Set[str] = set()
+        ful_records = []
         if ful_path.exists():
             with open(ful_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                ful_records = []
-                for row in reader:
+                for row in csv.DictReader(f):
                     fid = row.get("fulfillment_id", "").strip()
                     if not fid:
                         continue
                     fulfillment_ids.add(fid)
-                    ful_records.append(
-                        FulfillmentMethod(
-                            id=fid,
-                            shipping_method=row.get("shipping_method", "Standard"),
-                            service_level=row.get("service_level") or None,
-                            delivery_sla_days=int(row["delivery_sla_days"]) if row.get("delivery_sla_days") else 3,
-                            base_shipping_cost=float(row["base_shipping_cost"]) if row.get("base_shipping_cost") else 0.0,
-                        )
-                    )
-                session.add_all(ful_records)
-                await session.flush()
-                report["fulfillment_methods"] = len(ful_records)
-                logger.info("Seeded %d fulfillment methods.", len(ful_records))
+                    ful_records.append((
+                        fid,
+                        row.get("shipping_method", "Standard"),
+                        row.get("service_level") or None,
+                        int(row["delivery_sla_days"]) if row.get("delivery_sla_days") else 3,
+                        float(row["base_shipping_cost"]) if row.get("base_shipping_cost") else 0.0,
+                    ))
+            await conn.copy_records_to_table(
+                "fulfillment_methods",
+                records=ful_records,
+                columns=["id", "shipping_method", "service_level", "delivery_sla_days", "base_shipping_cost"]
+            )
+            report["fulfillment_methods"] = len(ful_records)
+            logger.info("Seeded %d fulfillment methods in %.2fs", len(ful_records), time.perf_counter() - t0)
 
         # ── 4. DIM_SELLER.csv ─────────────────────────────────────────────────
+        t0 = time.perf_counter()
         sel_path = DATASET_DIR / "DIM_SELLER.csv"
-        seller_ids: Set[str] = set()
+        sel_records = []
         if sel_path.exists():
             with open(sel_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                sel_records = []
-                for row in reader:
+                for row in csv.DictReader(f):
                     sid = row.get("seller_id", "").strip()
                     if not sid:
                         continue
-                    seller_ids.add(sid)
                     lid = row.get("location_id")
-                    sel_records.append(
-                        Seller(
-                            id=sid,
-                            name=row.get("seller_name", f"Seller {sid}"),
-                            email=row.get("email") or None,
-                            phone_number=row.get("phone_number") or None,
-                            join_date=row.get("join_date") or None,
-                            location_id=lid if lid in location_ids else None,
-                            rating=float(row["rating"]) if row.get("rating") else 0.0,
-                            category_focus=row.get("category_focus") or None,
-                        )
-                    )
-                session.add_all(sel_records)
-                await session.flush()
-                report["sellers"] = len(sel_records)
-                logger.info("Seeded %d sellers.", len(sel_records))
+                    sel_records.append((
+                        sid,
+                        row.get("seller_name", f"Seller {sid}"),
+                        row.get("email") or None,
+                        row.get("phone_number") or None,
+                        row.get("join_date") or None,
+                        lid if lid in location_ids else None,
+                        float(row["rating"]) if row.get("rating") else 0.0,
+                        row.get("category_focus") or None,
+                    ))
+            await conn.copy_records_to_table(
+                "sellers",
+                records=sel_records,
+                columns=["id", "name", "email", "phone_number", "join_date", "location_id", "rating", "category_focus"]
+            )
+            report["sellers"] = len(sel_records)
+            logger.info("Seeded %d sellers in %.2fs", len(sel_records), time.perf_counter() - t0)
 
         # ── 5. DIM_PRODUCT.csv ────────────────────────────────────────────────
+        t0 = time.perf_counter()
         prod_path = DATASET_DIR / "DIM_PRODUCT.csv"
-        products_map: Dict[str, Product] = {}
+        product_names_map: Dict[str, str] = {}
+        prod_records = []
         if prod_path.exists():
             with open(prod_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                prod_records = []
-                for row in reader:
+                for row in csv.DictReader(f):
                     pid = row.get("product_id", "").strip()
                     if not pid:
                         continue
@@ -234,411 +228,292 @@ async def seed_database(reset: bool = False, force: bool = False, max_customers:
                     price = float(row.get("list_price") or 49.99)
                     warranty = derive_warranty_months(category, sub_category)
                     desc = f"{brand} {pname} - Premium {category} ({sub_category}). Standard {warranty}-month warranty."
+                    product_names_map[pid] = pname
 
-                    p = Product(
-                        id=pid,
-                        name=pname,
-                        brand=brand,
-                        category=category,
-                        sub_category=sub_category,
-                        price=price,
-                        stock_quantity=50,
-                        warranty_months=warranty,
-                        description=desc,
-                    )
-                    prod_records.append(p)
-                    products_map[pid] = p
+                    prod_records.append((
+                        pid, pname, brand, category, sub_category, price, 50, warranty, desc
+                    ))
+            await conn.copy_records_to_table(
+                "products",
+                records=prod_records,
+                columns=["id", "name", "brand", "category", "sub_category", "price", "stock_quantity", "warranty_months", "description"]
+            )
+            report["products"] = len(prod_records)
+            logger.info("Seeded %d products in %.2fs", len(prod_records), time.perf_counter() - t0)
 
-                session.add_all(prod_records)
-                await session.flush()
-                report["products"] = len(prod_records)
-                logger.info("Seeded %d products across categories.", len(prod_records))
-
-        # ── 6. DIM_CUSTOMER.csv ───────────────────────────────────────────────
+        # ── 6. DIM_CUSTOMER.csv (ALL 90,832 records) ──────────────────────────
+        t0 = time.perf_counter()
         cust_path = DATASET_DIR / "DIM_CUSTOMER.csv"
-        customer_map: Dict[str, Customer] = {}
-        customer_email_map: Dict[str, Customer] = {}
+        customer_email_map: Dict[str, str] = {}
+        cust_records = []
+        sample_for_credentials = []
 
         if cust_path.exists():
             with open(cust_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                cust_records = []
-                count = 0
-                for row in reader:
+                for row in csv.DictReader(f):
                     cid = row.get("customer_id", "").strip()
                     email = (row.get("email") or "").strip().lower()
-                    if not cid or not email or "@" not in email:
-                        continue
-                    # Skip duplicate emails
-                    if email in customer_email_map:
+                    if not cid or not email:
                         continue
 
+                    fname = row.get("first_name", "Customer")
+                    lname = row.get("last_name", cid)
                     lid = row.get("location_id")
-                    c = Customer(
-                        id=cid,
-                        first_name=row.get("first_name", "Valued"),
-                        last_name=row.get("last_name", "Customer"),
-                        email=email,
-                        phone_number=row.get("phone_number") or None,
-                        gender=row.get("gender") or None,
-                        date_of_birth=row.get("date_of_birth") or None,
-                        registration_date=row.get("registration_date") or None,
-                        income_bracket=row.get("income_bracket") or None,
-                        marital_status=row.get("marital_status") or None,
-                        location_id=lid if lid in location_ids else None,
-                        upi_id=row.get("upi_id") or None,
-                        credit_card_number=row.get("credit_card_number") or None,
-                    )
-                    cust_records.append(c)
-                    customer_map[cid] = c
-                    customer_email_map[email] = c
+                    customer_email_map[cid] = email
 
-                    count += 1
-                    if count >= max_customers:
-                        break
+                    if len(sample_for_credentials) < 25:
+                        sample_for_credentials.append((cid, f"{fname} {lname}".strip(), email))
 
-                session.add_all(cust_records)
-                await session.flush()
-                report["customers"] = len(cust_records)
-                logger.info("Seeded %d customers.", len(cust_records))
+                    cust_records.append((
+                        cid,
+                        fname,
+                        lname,
+                        email,
+                        row.get("phone_number") or None,
+                        row.get("gender") or None,
+                        row.get("date_of_birth") or None,
+                        row.get("registration_date") or None,
+                        row.get("income_bracket") or None,
+                        row.get("marital_status") or None,
+                        lid if lid in location_ids else None,
+                        row.get("upi_id") or None,
+                        row.get("credit_card_number") or None,
+                    ))
 
-        # Also add demo customers Alice and Bob if not present (for test suite backwards compatibility)
-        if "alice@email.com" not in customer_email_map:
-            alice_cust = Customer(
-                id="CUST-ALICE-01",
-                first_name="Alice",
-                last_name="Johnson",
-                email="alice@email.com",
-                phone_number="+1 555 0192",
-            )
-            session.add(alice_cust)
-            customer_map[alice_cust.id] = alice_cust
-            customer_email_map[alice_cust.email] = alice_cust
+        # Add demo test customers Alice and Bob
+        cust_records.append((
+            "CUST-ALICE-01", "Alice", "Johnson", "alice@email.com", "+1 555 0192",
+            "F", "1990-01-01", "2024-01-01", "Middle", "Single", None, "alice@upi", "4111-2222-3333-4444"
+        ))
+        customer_email_map["CUST-ALICE-01"] = "alice@email.com"
 
-        if "bob@email.com" not in customer_email_map:
-            bob_cust = Customer(
-                id="CUST-BOB-02",
-                first_name="Bob",
-                last_name="Martinez",
-                email="bob@email.com",
-                phone_number="+1 555 0193",
-            )
-            session.add(bob_cust)
-            customer_map[bob_cust.id] = bob_cust
-            customer_email_map[bob_cust.email] = bob_cust
+        cust_records.append((
+            "CUST-BOB-02", "Bob", "Martinez", "bob@email.com", "+1 555 0193",
+            "M", "1988-05-14", "2024-01-01", "Upper-Middle", "Married", None, "bob@upi", "5111-2222-3333-5555"
+        ))
+        customer_email_map["CUST-BOB-02"] = "bob@email.com"
 
-        await session.flush()
+        await conn.copy_records_to_table(
+            "customers",
+            records=cust_records,
+            columns=[
+                "id", "first_name", "last_name", "email", "phone_number", "gender",
+                "date_of_birth", "registration_date", "income_bracket", "marital_status",
+                "location_id", "upi_id", "credit_card_number"
+            ]
+        )
+        report["customers"] = len(cust_records)
+        logger.info("Seeded ALL %d customers in %.2fs", len(cust_records), time.perf_counter() - t0)
 
         # ── 7. Users / Credentials Table ──────────────────────────────────────
-        # Master prompt requirement:
-        # "as there is no login so we need extra table to login get customer id from Kaggle dataset add it into new table that will store cread -- do not waste all your token here just have few creds and leave remaing if it is taking long tile"
-        user_records: List[User] = []
+        t0 = time.perf_counter()
+        now_utc = datetime.now(timezone.utc)
+        user_records = [
+            ("USR-ADMIN-01", None, "Admin One", "admin1@ecom.com", hash_password("admin123"), "admin", now_utc),
+            ("USR-ADMIN-02", None, "Admin Two", "admin2@ecom.com", hash_password("admin123"), "admin", now_utc),
+            ("USR-ALICE-01", "CUST-ALICE-01", "Alice Johnson", "alice@email.com", hash_password("user123"), "customer", now_utc),
+            ("USR-BOB-02", "CUST-BOB-02", "Bob Martinez", "bob@email.com", hash_password("user123"), "customer", now_utc),
+        ]
+        for cid, name, email in sample_for_credentials:
+            user_records.append((
+                f"USR-{cid}", cid, name or email.split("@")[0], email, hash_password("user123"), "customer", now_utc
+            ))
 
-        # 1) Admin accounts
-        admin1 = User(
-            id="USR-ADMIN-01",
-            name="Admin One",
-            email="admin1@ecom.com",
-            password_hash=hash_password("admin123"),
-            role="admin",
+        await conn.copy_records_to_table(
+            "users",
+            records=user_records,
+            columns=["id", "customer_id", "name", "email", "password_hash", "role", "created_at"]
         )
-        admin2 = User(
-            id="USR-ADMIN-02",
-            name="Admin Two",
-            email="admin2@ecom.com",
-            password_hash=hash_password("admin123"),
-            role="admin",
-        )
-        user_records.extend([admin1, admin2])
-
-        # 2) Seed customer credentials from the first Kaggle customers
-        sample_customers = list(customer_map.values())[:15]
-        for cust in sample_customers:
-            cust_name = f"{cust.first_name} {cust.last_name}".strip()
-            user_records.append(
-                User(
-                    id=f"USR-{cust.id}",
-                    customer_id=cust.id,
-                    name=cust_name or cust.email.split("@")[0],
-                    email=cust.email,
-                    password_hash=hash_password("user123"),
-                    role="customer",
-                )
-            )
-
-        # 3) Test suite demo accounts (Alice & Bob)
-        if "alice@email.com" in customer_email_map:
-            alice_c = customer_email_map["alice@email.com"]
-            user_records.append(
-                User(
-                    id="USR-ALICE-01",
-                    customer_id=alice_c.id,
-                    name="Alice Johnson",
-                    email="alice@email.com",
-                    password_hash=hash_password("user123"),
-                    role="customer",
-                )
-            )
-        if "bob@email.com" in customer_email_map:
-            bob_c = customer_email_map["bob@email.com"]
-            user_records.append(
-                User(
-                    id="USR-BOB-02",
-                    customer_id=bob_c.id,
-                    name="Bob Martinez",
-                    email="bob@email.com",
-                    password_hash=hash_password("user123"),
-                    role="customer",
-                )
-            )
-
-        session.add_all(user_records)
-        await session.flush()
         report["users"] = len(user_records)
-        logger.info("Seeded %d user credentials (2 admins, %d customer logins with password 'user123').", len(user_records), len(sample_customers))
+        logger.info("Seeded %d user credentials in %.2fs", len(user_records), time.perf_counter() - t0)
 
-        # ── 8. FACT_ORDERS.csv ────────────────────────────────────────────────
+        # ── 8. FACT_ORDERS.csv (ALL 342,033 orders & 790,732 lines) ───────────
+        t0 = time.perf_counter()
         orders_path = DATASET_DIR / "FACT_ORDERS.csv"
-        order_records_map: Dict[str, Order] = {}
-        order_items_list: List[OrderItem] = []
+        orders_dict: Dict[str, list] = {}
+        order_items_list: List[tuple] = []
 
         if orders_path.exists():
+            logger.info("Streaming and parsing FACT_ORDERS.csv (790,000+ records)...")
             with open(orders_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                lines_read = 0
+                for row in csv.DictReader(f):
+                    oid = row["order_id"]
+                    cid = row["customer_id"]
+                    pid = row["product_id"]
+                    line_id = row["order_line_id"]
+                    net_amt = float(row["net_amount"] or 0.0)
+                    cust_email = customer_email_map.get(cid, f"{cid.lower()}@ecom.com")
+                    prod_name = product_names_map.get(pid, f"Product {pid}")
 
-                for row in reader:
-                    oid = row.get("order_id", "").strip()
-                    cid = row.get("customer_id", "").strip()
-                    pid = row.get("product_id", "").strip()
-                    line_id = row.get("order_line_id", "").strip()
+                    if oid not in orders_dict:
+                        o_date = parse_date(row["order_date"]) or now_utc
+                        act_del = parse_date(row["actual_delivery_date"])
+                        exp_del = parse_date(row["expected_delivery_date"])
+                        r_status = (row["order_status"] or "Completed").strip().lower()
+                        status = "delivered" if (r_status == "completed" and act_del) else ("completed" if r_status == "completed" else r_status)
 
-                    # Only seed orders for customers and products that exist in our DB
-                    if cid not in customer_map or pid not in products_map or not oid:
-                        continue
-
-                    cust = customer_map[cid]
-                    prod = products_map[pid]
-                    order_date = parse_date(row.get("order_date")) or datetime.now(timezone.utc)
-                    actual_del = parse_date(row.get("actual_delivery_date"))
-                    expected_del = parse_date(row.get("expected_delivery_date"))
-
-                    raw_status = (row.get("order_status") or "Completed").strip().lower()
-                    if raw_status == "completed":
-                        status = "delivered" if actual_del else "processing"
-                    elif raw_status == "returned":
-                        status = "returned"
-                    elif raw_status == "cancelled":
-                        status = "cancelled"
+                        orders_dict[oid] = [
+                            oid,
+                            cid,
+                            cust_email,
+                            o_date,
+                            status,
+                            net_amt,
+                            float(row["shipping_fee"] or 0.0),
+                            float(row["tax_amount"] or 0.0),
+                            float(row["discount_amount"] or 0.0),
+                            f"TRK-{oid[3:]}",
+                            exp_del,
+                            act_del,
+                            int(row["delivery_sla_days"] or 2),
+                            int(row["delivery_delay_days"] or 0),
+                            row["payment_id"] if row.get("payment_id") in payment_ids else None,
+                            row["fulfillment_id"] if row.get("fulfillment_id") in fulfillment_ids else None,
+                            o_date,
+                        ]
                     else:
-                        status = raw_status
+                        orders_dict[oid][5] = round(orders_dict[oid][5] + net_amt, 2)
+                        orders_dict[oid][7] = round(orders_dict[oid][7] + float(row["tax_amount"] or 0.0), 2)
+                        orders_dict[oid][8] = round(orders_dict[oid][8] + float(row["discount_amount"] or 0.0), 2)
 
-                    qty = int(row.get("quantity") or 1)
-                    unit_p = float(row.get("unit_price") or prod.price)
-                    disc_pct = float(row.get("discount_percentage") or 0.0)
-                    tax_pct = float(row.get("tax_percentage") or 0.0)
-                    net_amt = float(row.get("net_amount") or (qty * unit_p))
+                    order_items_list.append((
+                        line_id,
+                        oid,
+                        pid,
+                        prod_name,
+                        int(row["quantity"] or 1),
+                        float(row["unit_price"] or 0.0),
+                        float(row["discount_percentage"] or 0.0),
+                        float(row["tax_percentage"] or 0.0),
+                        net_amt,
+                    ))
 
-                    # Aggregate order header
-                    if oid not in order_records_map:
-                        pay_id = row.get("payment_id")
-                        ful_id = row.get("fulfillment_id")
+        # Alice & Bob test fixture orders
+        first_pid = next(iter(product_names_map))
+        second_pid = list(product_names_map.keys())[1]
 
-                        order_obj = Order(
-                            id=oid,
-                            customer_id=cid,
-                            customer_email=cust.email,
-                            order_date=order_date,
-                            status=status,
-                            total_amount=round(net_amt, 2),
-                            shipping_fee=float(row.get("shipping_fee") or 0.0),
-                            tax_amount=float(row.get("tax_amount") or 0.0),
-                            discount_amount=float(row.get("discount_amount") or 0.0),
-                            tracking_number=f"TRK-{oid.replace('ORD', '')}",
-                            expected_delivery_date=expected_del,
-                            actual_delivery_date=actual_del,
-                            delivery_sla_days=int(row.get("delivery_sla_days") or 2),
-                            delivery_delay_days=int(row.get("delivery_delay_days") or 0),
-                            payment_id=pay_id if pay_id in payment_ids else None,
-                            fulfillment_id=ful_id if ful_id in fulfillment_ids else None,
-                            created_at=order_date,
-                        )
-                        order_records_map[oid] = order_obj
-                    else:
-                        order_records_map[oid].total_amount = round(order_records_map[oid].total_amount + net_amt, 2)
+        orders_dict["ORD-2024-001"] = [
+            "ORD-2024-001", "CUST-ALICE-01", "alice@email.com", now_utc, "delivered",
+            79.99, 5.99, 4.0, 0.0, "TRK-98214001", now_utc, now_utc, 2, 0, "PAY001", "FUL002", now_utc
+        ]
+        order_items_list.append((
+            "OL-ALICE-01", "ORD-2024-001", first_pid, product_names_map[first_pid],
+            1, 79.99, 0.0, 5.0, 79.99
+        ))
 
-                    # Order item line
-                    item_obj = OrderItem(
-                        id=line_id,
-                        order_id=oid,
-                        product_id=pid,
-                        product_name=prod.name,
-                        quantity=qty,
-                        unit_price=unit_p,
-                        discount_percentage=disc_pct,
-                        tax_percentage=tax_pct,
-                        net_amount=round(net_amt, 2),
-                    )
-                    order_items_list.append(item_obj)
+        orders_dict["ORD-2024-002"] = [
+            "ORD-2024-002", "CUST-BOB-02", "bob@email.com", now_utc, "delivered",
+            149.99, 8.99, 7.5, 0.0, "TRK-98214002", now_utc, now_utc, 2, 0, "PAY002", "FUL001", now_utc
+        ]
+        order_items_list.append((
+            "OL-BOB-01", "ORD-2024-002", second_pid, product_names_map[second_pid],
+            1, 149.99, 0.0, 5.0, 149.99
+        ))
 
-                    lines_read += 1
-                    if len(order_records_map) >= max_orders:
-                        break
-
-            session.add_all(list(order_records_map.values()))
-            session.add_all(order_items_list)
-            await session.flush()
-            report["orders"] = len(order_records_map)
-            report["order_items"] = len(order_items_list)
-            logger.info("Seeded %d orders with %d line items from Kaggle dataset.", len(order_records_map), len(order_items_list))
-
-        # Also add explicit orders for Alice & Bob (for testing delivered returns and refunds)
-        now = datetime.now(timezone.utc)
-        first_prod = list(products_map.values())[0]
-        second_prod = list(products_map.values())[1]
-
-        alice_ord = Order(
-            id="ORD-2024-001",
-            customer_id=customer_email_map["alice@email.com"].id,
-            customer_email="alice@email.com",
-            order_date=now,
-            status="delivered",
-            total_amount=round(first_prod.price, 2),
-            tracking_number="TRK-98214001",
-            actual_delivery_date=now,
-            created_at=now,
+        # Bulk copy orders
+        orders_tuples = [tuple(v) for v in orders_dict.values()]
+        logger.info("Executing COPY for %d orders...", len(orders_tuples))
+        await conn.copy_records_to_table(
+            "orders",
+            records=orders_tuples,
+            columns=[
+                "id", "customer_id", "customer_email", "order_date", "status", "total_amount",
+                "shipping_fee", "tax_amount", "discount_amount", "tracking_number",
+                "expected_delivery_date", "actual_delivery_date", "delivery_sla_days",
+                "delivery_delay_days", "payment_id", "fulfillment_id", "created_at"
+            ]
         )
-        session.add(alice_ord)
-        alice_item = OrderItem(
-            id="OL-ALICE-01",
-            order_id="ORD-2024-001",
-            product_id=first_prod.id,
-            product_name=first_prod.name,
-            quantity=1,
-            unit_price=first_prod.price,
-            net_amount=first_prod.price,
-        )
-        session.add(alice_item)
+        report["orders"] = len(orders_tuples)
 
-        bob_ord = Order(
-            id="ORD-2024-002",
-            customer_id=customer_email_map["bob@email.com"].id,
-            customer_email="bob@email.com",
-            order_date=now,
-            status="delivered",
-            total_amount=round(second_prod.price, 2),
-            tracking_number="TRK-98214002",
-            actual_delivery_date=now,
-            created_at=now,
+        # Bulk copy order items
+        logger.info("Executing COPY for %d order items...", len(order_items_list))
+        await conn.copy_records_to_table(
+            "order_items",
+            records=order_items_list,
+            columns=[
+                "id", "order_id", "product_id", "product_name", "quantity",
+                "unit_price", "discount_percentage", "tax_percentage", "net_amount"
+            ]
         )
-        session.add(bob_ord)
-        bob_item = OrderItem(
-            id="OL-BOB-01",
-            order_id="ORD-2024-002",
-            product_id=second_prod.id,
-            product_name=second_prod.name,
-            quantity=1,
-            unit_price=second_prod.price,
-            net_amount=second_prod.price,
-        )
-        session.add(bob_item)
-        await session.flush()
+        report["order_items"] = len(order_items_list)
+        logger.info("Seeded ALL %d orders with %d order items in %.2fs", len(orders_tuples), len(order_items_list), time.perf_counter() - t0)
 
-        # ── 9. FACT_RETURNS.csv ───────────────────────────────────────────────
+        # ── 9. FACT_RETURNS.csv (ALL 103,035 records) ─────────────────────────
+        t0 = time.perf_counter()
         returns_path = DATASET_DIR / "FACT_RETURNS.csv"
-        returns_list: List[Return] = []
-        refunds_list: List[Refund] = []
+        returns_list: List[tuple] = []
+        refunds_list: List[tuple] = []
 
         if returns_path.exists():
+            logger.info("Streaming and parsing FACT_RETURNS.csv (103,000+ records)...")
             with open(returns_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    oid = row.get("order_id", "").strip()
-                    cid = row.get("customer_id", "").strip()
-                    pid = row.get("product_id", "").strip()
-                    line_id = row.get("order_line_id", "").strip()
-
-                    # Only seed returns for orders and customers present in our seeded DB
-                    if oid not in order_records_map or cid not in customer_map:
+                for row in csv.DictReader(f):
+                    line_id = row["order_line_id"]
+                    oid = row["order_id"]
+                    cid = row["customer_id"]
+                    pid = row["product_id"]
+                    if oid not in orders_dict or cid not in customer_email_map:
                         continue
 
                     rma_code = f"RMA-{line_id.replace('OL', '')}"
-                    reason = row.get("review_text") or "Product return requested"
+                    ref_id = f"REF-{line_id.replace('OL', '')}"
+                    reason = row.get("review_text") or "Customer return requested"
                     days_ret = int(row.get("days_to_return") or 2)
                     restock = float(row.get("restocking_fee") or 0.0)
 
-                    ret_obj = Return(
-                        id=rma_code,
-                        order_id=oid,
-                        order_line_id=line_id,
-                        customer_id=cid,
-                        product_id=pid if pid in products_map else None,
-                        reason=reason,
-                        status="approved",
-                        days_to_return=days_ret,
-                        restocking_fee=restock,
-                        created_at=order_records_map[oid].created_at,
-                    )
-                    returns_list.append(ret_obj)
-
-                    # Create matching refund
                     raw_amt = float(row.get("refund_amount") or 0.0)
                     amt = abs(raw_amt) if raw_amt != 0 else float(row.get("unit_price") or 50.0)
                     ref_status = "completed" if amt <= 50.0 else "pending_admin_approval"
+                    dt = parse_date(row.get("date_id")) or now_utc
 
-                    refund_obj = Refund(
-                        id=f"REF-{line_id.replace('OL', '')}",
-                        return_id=rma_code,
-                        order_id=oid,
-                        amount=round(amt, 2),
-                        status=ref_status,
-                        idempotency_key=f"seed-key-{line_id}",
-                        created_at=order_records_map[oid].created_at,
-                    )
-                    refunds_list.append(refund_obj)
+                    returns_list.append((
+                        rma_code, oid, line_id, cid, pid if pid in product_names_map else None,
+                        reason, "approved", days_ret, restock, dt
+                    ))
+                    refunds_list.append((
+                        ref_id, rma_code, oid, round(amt, 2), ref_status, f"seed-key-{line_id}", dt
+                    ))
 
-            session.add_all(returns_list)
-            session.add_all(refunds_list)
-            await session.flush()
-            report["returns"] = len(returns_list)
-            report["refunds"] = len(refunds_list)
-            logger.info("Seeded %d returns and %d refund transactions from Kaggle dataset.", len(returns_list), len(refunds_list))
+        # Admin test fixture return and refund
+        returns_list.append((
+            "RMA-ADMIN-TEST", "ORD-2024-001", "OL-ALICE-01", "CUST-ALICE-01", first_pid,
+            "Defective component on delivery", "requested", 2, 0.0, now_utc
+        ))
+        refunds_list.append((
+            "REF-ADMIN-TEST", "RMA-ADMIN-TEST", "ORD-2024-001", 149.99,
+            "pending_admin_approval", "seed-key-admin-test-01", now_utc
+        ))
 
-        # Fixture return and pending refund for admin approval test case (order ORD-2024-001)
-        test_rma = Return(
-            id="RMA-ADMIN-TEST",
-            order_id="ORD-2024-001",
-            customer_id=customer_email_map["alice@email.com"].id,
-            product_id=first_prod.id,
-            reason="Defective component on delivery",
-            status="requested",
-            created_at=now,
+        logger.info("Executing COPY for %d returns and %d refunds...", len(returns_list), len(refunds_list))
+        await conn.copy_records_to_table(
+            "returns",
+            records=returns_list,
+            columns=["id", "order_id", "order_line_id", "customer_id", "product_id", "reason", "status", "days_to_return", "restocking_fee", "created_at"]
         )
-        session.add(test_rma)
-        test_ref = Refund(
-            id="REF-ADMIN-TEST",
-            return_id="RMA-ADMIN-TEST",
-            order_id="ORD-2024-001",
-            amount=149.99,
-            status="pending_admin_approval",
-            idempotency_key="seed-key-admin-test-01",
-            created_at=now,
+        await conn.copy_records_to_table(
+            "refunds",
+            records=refunds_list,
+            columns=["id", "return_id", "order_id", "amount", "status", "idempotency_key", "created_at"]
         )
-        session.add(test_ref)
+        report["returns"] = len(returns_list)
+        report["refunds"] = len(refunds_list)
+        logger.info("Seeded ALL %d returns & %d refunds in %.2fs", len(returns_list), len(refunds_list), time.perf_counter() - t0)
 
-        # ── 10. Ingest Policy Documents ───────────────────────────────────────
+    finally:
+        await conn.close()
+
+    # ── 10. Ingest Policy Documents ───────────────────────────────────────────
+    async with AsyncSessionLocal() as session:
         logger.info("Ingesting store policy documents into vector storage...")
         policy_count = await ingest_policies(session)
         report["policies"] = policy_count
 
-        await session.commit()
-
-        elapsed = round(time.perf_counter() - start_time, 2)
-        report["elapsed_seconds"] = elapsed
-        logger.info("==================================================")
-        logger.info("DATABASE SEEDING COMPLETED IN %s SECONDS", elapsed)
-        logger.info("Seeding Report: %s", report)
-        logger.info("==================================================")
+    elapsed = round(time.perf_counter() - start_time, 2)
+    report["elapsed_seconds"] = elapsed
+    logger.info("==================================================")
+    logger.info("FULL DATASET SEEDING COMPLETED IN %.2f SECONDS", elapsed)
+    logger.info("Seeding Report: %s", report)
+    logger.info("==================================================")
 
     return report
 
