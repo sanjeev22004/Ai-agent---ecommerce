@@ -1,14 +1,20 @@
-"""Stateful Agent Orchestrator with ReAct loop, two-tier intent routing, guardrails, and observability.
+"""Stateful Agent Orchestrator with ReAct loop, two-tier intent routing, guardrails, resilience, and telemetry.
 
 Implements:
-1. Two-Tier Intent Router:
+1. Security Guardrails:
+   - Multi-vector prompt injection & jailbreak defense.
+   - Business scope enforcement (Strictly 5 domains: Product Info, Shipping, Orders, Returns, Refunds).
+2. Two-Tier Intent Router:
    - FAST_PATH: Deterministic sub-80ms execution for routine order/inventory queries (Zero LLM calls).
    - SLOW_PATH: ReAct agent for complex multi-step reasoning, returns, refunds, and policy queries.
-2. Dynamic Role-Based Tool Scoping:
+3. Dynamic Role-Based Tool Scoping:
    - Exposes only authorized tools to the LLM based on authenticated user's role.
-3. Defense-in-Depth Parameter Sanitization & Injection Defense.
-4. Execution Loop Guardrails (Max 5 iterations, duplicate tool prevention).
-5. Observability with ExecutionTrace and ChatMessage persistence in PostgreSQL.
+4. Resilience & Graceful Degradation:
+   - Bounded retries for transient operations.
+   - Automated support ticket generation on persistent failures.
+5. Observability & Telemetry:
+   - PII-redacted, non-blocking telemetry logging with fail-open safety.
+   - ExecutionTrace and ChatMessage persistence in PostgreSQL.
 """
 
 from datetime import datetime, timezone
@@ -17,19 +23,29 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from openai import AsyncOpenAI
+from app.config import settings
+
+try:
+    from langfuse.openai import AsyncOpenAI
+except ImportError:
+    from openai import AsyncOpenAI
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.config import settings
 from app.db.models import ChatMessage, ChatSession, ExecutionTrace, User
 from app.tools.mcp_tools import execute_tool
+from app.rag.retriever import retrieve_policies
 from app.router.intent_router import (
     DeterministicIntentRouter,
     RouteTarget,
     execute_fast_path,
 )
 from app.router.tool_registry import get_tools_for_role
+from app.security.guardrails import SecurityGuardrails
+from app.security.pii import redact_pii_text
+from app.resilience.retry import execute_with_bounded_retry
+from app.resilience.degradation import create_support_ticket, build_degraded_response
+from app.observability.langfuse_client import telemetry
 from app.agent.prompts import (
     ORCHESTRATOR_SYSTEM_PROMPT,
     OFF_TOPIC_RESPONSE,
@@ -39,85 +55,35 @@ from app.agent.tracer import ActiveTrace
 
 logger = logging.getLogger(__name__)
 
-# Injection pattern regexes
-INJECTION_REGEX = re.compile(
-    r"(ignore\s+(all\s+)?(previous|prior|above)\s+instructions|"
-    r"disregard\s+system\s+prompt|"
-    r"system\s+override|"
-    r"you\s+are\s+now\s+(in\s+developer\s+mode|unrestricted|an\s+evil)|"
-    r"jailbreak|"
-    r"bypass\s+all\s+safety|"
-    r"reveal\s+your\s+system\s+prompt)",
-    re.IGNORECASE,
-)
-
 # Greeting regex
 GREETING_REGEX = re.compile(
     r"^(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening|day))[\s!.,?]*$",
     re.IGNORECASE,
 )
 
-# Off-topic patterns (coding, leetcode, general essays, math)
-OFF_TOPIC_REGEX = re.compile(
-    r"\b(write\s+(a\s+)?(python|javascript|typescript|c\+\+|java|rust|go|code|script|program)|"
-    r"leetcode|hackerrank|spiral\s+matrix|binary\s+tree|quicksort|merge\s+sort|"
-    r"reverse\s+linked\s+list|fibonacci|solve\s+(this\s+)?(equation|math|integral)|"
-    r"write\s+(an\s+)?essay\s+on|who\s+was\s+(napoleon|caesar|alexander))\b",
-    re.IGNORECASE,
-)
 
-
-def triage_message(user_message: str) -> Optional[str]:
-    """Pre-screen queries for greetings or off-topic requests.
-
-    Returns a direct string answer if detected, or None to proceed to the router/agent.
-    """
+def triage_greeting(user_message: str) -> Optional[str]:
+    """Check for simple greetings or thank yous."""
     clean_msg = user_message.strip()
-
-    # 1. Simple greetings
     if GREETING_REGEX.match(clean_msg):
         return GREETING_RESPONSE
-
-    # 2. Thank yous
     if re.match(r"^(thanks|thank\s+you|thx)[\s!.,]*$", clean_msg, re.IGNORECASE):
-        return "You're very welcome! Let me know if you need any other assistance with your orders or products."
-
-    # 3. Off-topic coding / math / essays
-    if OFF_TOPIC_REGEX.search(clean_msg):
-        return OFF_TOPIC_RESPONSE
-
+        return "You're very welcome! Let me know if you need any other assistance with your orders, returns, or products."
     return None
 
 
-def sanitize_parameter_value(val: Any) -> Any:
-    """Sanitize parameter values and neutralize prompt injections."""
-    if isinstance(val, str):
-        if INJECTION_REGEX.search(val):
-            logger.warning("Potential prompt injection pattern detected in parameter: %r", val)
-            return INJECTION_REGEX.sub("[BLOCKED_INJECTION_PHRASE]", val)
-        return val
-    elif isinstance(val, dict):
-        return {k: sanitize_parameter_value(v) for k, v in val.items()}
-    elif isinstance(val, list):
-        return [sanitize_parameter_value(x) for x in val]
-    return val
-
-
 def normalize_tool_arguments(tool_name: str, raw_args: Dict[str, Any]) -> Dict[str, Any]:
-    """Clean and normalize tool arguments from local or hosted models."""
+    """Clean and normalize tool arguments."""
     args = dict(raw_args)
-
-    # Unwrap nested schemas like {"properties": {...}} or {"input": {...}}
     for key in ("properties", "parameters", "arguments", "input"):
         if key in args and isinstance(args[key], dict) and not isinstance(args[key], list):
             args = dict(args[key])
 
-    # Strip empty dict metadata objects
     clean: Dict[str, Any] = {}
     for k, v in args.items():
         if isinstance(v, dict) and not v:
             continue
-        clean[k] = sanitize_parameter_value(v)
+        clean[k] = v
 
     return clean
 
@@ -127,9 +93,11 @@ class AgentOrchestrator:
         self.client = AsyncOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
+            timeout=httpx.Timeout(5.0, connect=2.0),
         )
         self.model_name = settings.LLM_MODEL
         self.router = DeterministicIntentRouter()
+        self.guardrails = SecurityGuardrails()
 
     async def get_or_create_session(
         self,
@@ -168,7 +136,7 @@ class AgentOrchestrator:
         user_message: str,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute full request flow: Triage -> Two-Tier Router -> Fast Path or ReAct Agent."""
+        """Execute full request lifecycle: Guardrails -> Triage -> Fast Path -> ReAct Agent."""
         chat_session = await self.get_or_create_session(
             db_session, user, session_id, first_message=user_message
         )
@@ -186,11 +154,15 @@ class AgentOrchestrator:
             user_details=user_info,
         )
 
-        # ── 1. Off-Topic Triage ───────────────────────────────────────────────
-        direct_reply = triage_message(user_message)
-        if direct_reply:
-            step = trace.start_step("triage_direct", "Off-topic / Greeting direct response", {"query": user_message})
-            step.finish(output=direct_reply)
+        # ── 1. Security & Business Scope Guardrails ───────────────────────────
+        guardrail_eval = self.guardrails.evaluate(user_message)
+        if not guardrail_eval.allowed:
+            step = trace.start_step(
+                "security_guardrail",
+                f"Guardrail Refusal: {guardrail_eval.refusal_reason}",
+                {"query": user_message},
+            )
+            step.finish(output=guardrail_eval.refusal_message)
 
             user_msg_record = ChatMessage(
                 session_id=chat_session.id,
@@ -201,45 +173,113 @@ class AgentOrchestrator:
             asst_msg_record = ChatMessage(
                 session_id=chat_session.id,
                 role="assistant",
-                content=direct_reply,
+                content=guardrail_eval.refusal_message,
                 created_at=datetime.now(timezone.utc),
             )
             db_session.add(user_msg_record)
             db_session.add(asst_msg_record)
 
-            final_trace = trace.finalize(direct_reply, status="triage_direct")
+            final_trace = trace.finalize(guardrail_eval.refusal_message, status="guardrail_blocked")
             db_trace = ExecutionTrace(
                 session_id=chat_session.id,
                 user_details=user_details_json,
                 trace_id=final_trace["trace_id"],
                 user_message=user_message,
-                final_response=direct_reply,
+                final_response=guardrail_eval.refusal_message,
                 total_latency_ms=final_trace["total_latency_ms"],
-                prompt_tokens=final_trace["prompt_tokens"],
-                completion_tokens=final_trace["completion_tokens"],
-                estimated_cost_usd=final_trace["estimated_cost_usd"],
-                status=final_trace["status"],
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost_usd=0.0,
+                status="guardrail_blocked",
                 steps_json=final_trace["steps_json"],
                 created_at=datetime.now(timezone.utc),
             )
             db_session.add(db_trace)
             await db_session.commit()
 
+            telemetry.log_interaction_async(
+                trace_id=final_trace["trace_id"],
+                session_id=chat_session.id,
+                user_id=user.id,
+                user_email=user.email,
+                user_message=user_message,
+                final_response=guardrail_eval.refusal_message,
+                route="guardrail_blocked",
+                latency_ms=final_trace["total_latency_ms"],
+                status="guardrail_blocked",
+            )
+
             return {
                 "session_id": chat_session.id,
-                "response": direct_reply,
+                "response": guardrail_eval.refusal_message,
                 "tool_calls": [],
                 "trace": final_trace,
+                "fast_path": False,
             }
 
-        # ── 2. Deterministic Two-Tier Intent Router ───────────────────────────
+        # ── 2. Greeting Triage ────────────────────────────────────────────────
+        greeting_reply = triage_greeting(user_message)
+        if greeting_reply:
+            step = trace.start_step("triage_direct", "Greeting response", {"query": user_message})
+            step.finish(output=greeting_reply)
+
+            user_msg_record = ChatMessage(
+                session_id=chat_session.id,
+                role="user",
+                content=user_message,
+                created_at=datetime.now(timezone.utc),
+            )
+            asst_msg_record = ChatMessage(
+                session_id=chat_session.id,
+                role="assistant",
+                content=greeting_reply,
+                created_at=datetime.now(timezone.utc),
+            )
+            db_session.add(user_msg_record)
+            db_session.add(asst_msg_record)
+
+            final_trace = trace.finalize(greeting_reply, status="triage_direct")
+            db_trace = ExecutionTrace(
+                session_id=chat_session.id,
+                user_details=user_details_json,
+                trace_id=final_trace["trace_id"],
+                user_message=user_message,
+                final_response=greeting_reply,
+                total_latency_ms=final_trace["total_latency_ms"],
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost_usd=0.0,
+                status="triage_direct",
+                steps_json=final_trace["steps_json"],
+                created_at=datetime.now(timezone.utc),
+            )
+            db_session.add(db_trace)
+            await db_session.commit()
+
+            telemetry.log_interaction_async(
+                trace_id=final_trace["trace_id"],
+                session_id=chat_session.id,
+                user_id=user.id,
+                user_email=user.email,
+                user_message=user_message,
+                final_response=greeting_reply,
+                route="triage",
+                latency_ms=final_trace["total_latency_ms"],
+                status="triage_direct",
+            )
+
+            return {
+                "session_id": chat_session.id,
+                "response": greeting_reply,
+                "tool_calls": [],
+                "trace": final_trace,
+                "fast_path": False,
+            }
+
+        # ── 3. Deterministic Fast Path ────────────────────────────────────────
         decision = self.router.classify(user_message, current_user=user)
         if decision.target == RouteTarget.FAST_PATH:
-            logger.info(
-                "Deterministic Fast-Path routed for intent '%s' (User: %s)",
-                decision.intent.value if decision.intent else "unknown",
-                user.email,
-            )
+            logger.info("Fast-Path routed for intent '%s' (User: %s)", decision.intent.value if decision.intent else "unknown", user.email)
             step = trace.start_step(
                 "fast_path_execution",
                 f"Fast-Path Dispatch: {decision.intent.value if decision.intent else 'unknown'}",
@@ -250,7 +290,6 @@ class AgentOrchestrator:
             )
             step.finish(output={"response": fast_reply, "tool_calls": fast_tool_calls})
 
-            # Persist Chat Messages
             user_msg_record = ChatMessage(
                 session_id=chat_session.id,
                 role="user",
@@ -285,6 +324,19 @@ class AgentOrchestrator:
             db_session.add(db_trace)
             await db_session.commit()
 
+            telemetry.log_interaction_async(
+                trace_id=final_trace["trace_id"],
+                session_id=chat_session.id,
+                user_id=user.id,
+                user_email=user.email,
+                user_message=user_message,
+                final_response=fast_reply,
+                route="fast_path",
+                latency_ms=final_trace["total_latency_ms"],
+                tool_calls=fast_tool_calls,
+                status="fast_path_success",
+            )
+
             return {
                 "session_id": chat_session.id,
                 "response": fast_reply,
@@ -293,7 +345,7 @@ class AgentOrchestrator:
                 "fast_path": True,
             }
 
-        # ── 3. Slow Path: ReAct Agent with Dynamic Role-Based Tool Scoping ───
+        # ── 4. Slow Path: ReAct Agent with Role Scoping & Resilience ──────────
         logger.info("Routing query to Slow Path ReAct Agent (User: %s, Role: %s)", user.email, user.role)
         role_restriction = (
             "- Customer Scoping: You are scoped ONLY to orders for " + user.email +
@@ -309,10 +361,8 @@ class AgentOrchestrator:
             role_restriction=role_restriction,
         )
 
-        # Dynamic Tool Scoping: Expose ONLY authorized tools to the LLM
         role_scoped_tools = get_tools_for_role(user.role)
 
-        # Retrieve last 10 session messages for context
         res_history = await db_session.execute(
             select(ChatMessage)
             .where(ChatMessage.session_id == chat_session.id)
@@ -346,12 +396,38 @@ class AgentOrchestrator:
                     tools=role_scoped_tools,
                     tool_choice="auto",
                     temperature=0.1,
+                    name="react-llm-reasoning",
+                    trace_id=trace.trace_id,
                 )
             except Exception as e:
-                logger.exception("LLM API call failed: %s", e)
-                error_msg = f"I encountered a temporary communication issue with our AI reasoning service ({str(e)[:80]}). Please try again."
+                logger.warning("LLM API call unavailable or timed out (%s). Activating local RAG degradation...", e)
                 llm_step.finish(output={"error": str(e)}, is_error=True)
-                final_text = error_msg
+                try:
+                    policy_matches = await retrieve_policies(db_session, user_message, top_k=2)
+                    if policy_matches:
+                        top_p = policy_matches[0]
+                        final_text = (
+                            f"### Policy Information: **{top_p.get('title', 'Store Policy')}**\n\n"
+                            f"{top_p.get('content', '')}\n\n"
+                            f"*(Retrieved via Offline Hybrid RAG from `{top_p.get('source_file')}`)*"
+                        )
+                    else:
+                        ticket = await create_support_ticket(
+                            db_session,
+                            customer_id=getattr(user, "customer_id", None) or user.id,
+                            customer_email=user.email,
+                            issue_description=f"AI reasoning outage on user query: {user_message}",
+                            failed_tool="llm_reasoning",
+                            priority="medium",
+                        )
+                        final_text = build_degraded_response(
+                            ticket_id=ticket.id,
+                            user_message=user_message,
+                            failure_reason="Temporary reasoning service connectivity limit",
+                        )
+                except Exception as fallback_err:
+                    logger.exception("Fallback degradation failed: %s", fallback_err)
+                    final_text = "Our customer support team is available to assist you. A support ticket has been scheduled."
                 break
 
             response_msg = completion.choices[0].message
@@ -403,13 +479,33 @@ class AgentOrchestrator:
                 else:
                     executed_signatures.add(sig)
                     t_step = trace.start_step("tool_call", f"Tool: {fn_name}", norm_args)
-                    tool_result = await execute_tool(fn_name, norm_args, db_session, current_user=user)
+
+                    # Bounded Retry & Degradation protection
+                    try:
+                        async def call_tool():
+                            return await execute_tool(fn_name, norm_args, db_session, current_user=user)
+
+                        tool_result = await execute_with_bounded_retry(
+                            call_tool, max_retries=2, base_delay_ms=50.0
+                        )
+                    except Exception as exc:
+                        logger.exception("Persistent failure on tool %s: %s", fn_name, exc)
+                        ticket_id = await create_support_ticket(
+                            db_session, user, fn_name, "tool_execution_failure", user_message, {"error": str(exc)}
+                        )
+                        tool_result = {
+                            "error": f"Tool failed after retries. Created support ticket {ticket_id}.",
+                            "ticket_id": ticket_id,
+                            "degraded_message": build_degraded_response(ticket_id, fn_name),
+                        }
+
                     t_step.finish(output=tool_result)
 
                 executed_tool_calls.append({
                     "tool": fn_name,
                     "args": norm_args,
                     "result": tool_result,
+                    "duration_ms": t_step.duration_ms,
                 })
 
                 messages.append({
@@ -418,7 +514,6 @@ class AgentOrchestrator:
                     "content": json.dumps(tool_result),
                 })
 
-        # Save to database
         user_msg_record = ChatMessage(
             session_id=chat_session.id,
             role="user",
@@ -452,6 +547,21 @@ class AgentOrchestrator:
         )
         db_session.add(db_trace)
         await db_session.commit()
+
+        telemetry.log_interaction_async(
+            trace_id=final_trace["trace_id"],
+            session_id=chat_session.id,
+            user_id=user.id,
+            user_email=user.email,
+            user_message=user_message,
+            final_response=final_text,
+            route="slow_path",
+            latency_ms=final_trace["total_latency_ms"],
+            prompt_tokens=final_trace["prompt_tokens"],
+            completion_tokens=final_trace["completion_tokens"],
+            tool_calls=executed_tool_calls,
+            status="completed",
+        )
 
         return {
             "session_id": chat_session.id,

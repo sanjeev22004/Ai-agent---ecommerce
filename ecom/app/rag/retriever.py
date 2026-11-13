@@ -1,7 +1,12 @@
-"""Retriever for policy documents using pgvector cosine similarity search.
+"""Production-Grade Hybrid Policy Retriever with RRF and Cross-Encoder Reranking.
 
-Supports active date filtering (effective_from <= order_date <= effective_to)
-and both PostgreSQL + pgvector and in-process cosine similarity fallback modes.
+Implements:
+1. Temporal policy filtering (effective_from <= order_date <= effective_to).
+2. Dual-channel retrieval:
+   - Dense channel: Cosine similarity against SentenceTransformers embeddings.
+   - Sparse channel: Lexical term frequency / BM25-style keyword matching.
+3. Reciprocal Rank Fusion (RRF with k=60) producing Top-N candidates (N=20).
+4. Cross-Encoder / High-Precision Composite Reranking filtering candidates to final Top-K (K=3).
 """
 
 from datetime import datetime, timezone
@@ -15,8 +20,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import Policy
 from app.rag.ingest import get_embedding_model
+from app.rag.hybrid import (
+    tokenize_text,
+    compute_bm25_lexical_score,
+    reciprocal_rank_fusion,
+)
+from app.rag.reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
+
+reranker = CrossEncoderReranker()
 
 
 def parse_order_date(order_date_input: Union[str, datetime]) -> Optional[datetime]:
@@ -59,18 +72,16 @@ async def search_policies(
     query: str,
     top_k: int = 3,
     order_date: Optional[Union[str, datetime]] = None,
+    use_hybrid: bool = True,
+    use_reranker: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Perform cosine similarity vector search over policies with optional date filtering."""
+    """Execute two-stage hybrid retrieval with RRF and cross-encoder reranking."""
     if not query.strip():
         return []
 
-    model = get_embedding_model()
-    query_vector = model.encode(query, normalize_embeddings=True)
-    query_list = query_vector.tolist()
-
     parsed_date = parse_order_date(order_date) if order_date else None
 
-    # Base date filter conditions
+    # Temporal Filtering: effective_from <= order_date <= effective_to
     conditions = []
     if parsed_date:
         conditions.append(Policy.effective_from <= parsed_date)
@@ -81,38 +92,7 @@ async def search_policies(
             )
         )
 
-    # 1. Attempt PostgreSQL native pgvector cosine distance if on Postgres
-    if settings.is_postgres:
-        try:
-            distance_col = Policy.embedding.cosine_distance(query_list)
-            stmt = select(Policy, distance_col.label("distance"))
-            if conditions:
-                stmt = stmt.where(and_(*conditions))
-            stmt = stmt.order_by(distance_col).limit(top_k)
-
-            result = await session.execute(stmt)
-            rows = result.all()
-
-            results: List[Dict[str, Any]] = []
-            for policy, distance in rows:
-                sim = max(0.0, min(1.0, 1.0 - float(distance)))
-                results.append({
-                    "id": policy.id,
-                    "title": policy.title,
-                    "content": policy.content,
-                    "format": policy.format,
-                    "source_file": policy.source_file,
-                    "version": policy.version,
-                    "effective_from": policy.effective_from.isoformat() if policy.effective_from else None,
-                    "effective_to": policy.effective_to.isoformat() if policy.effective_to else None,
-                    "similarity": round(sim, 4),
-                    "source": f"[Source: {policy.source_file}]",
-                })
-            return results
-        except Exception as e:
-            logger.info("Native pgvector operator unavailable (%s). Using in-process cosine similarity.", e)
-
-    # 2. In-process vector cosine similarity
+    # 1. Fetch eligible policy pool from database
     stmt = select(Policy)
     if conditions:
         stmt = stmt.where(and_(*conditions))
@@ -121,37 +101,84 @@ async def search_policies(
     policies = result.scalars().all()
 
     if not policies:
+        logger.info("No policy documents match temporal criteria for date: %s", parsed_date)
         return []
 
-    scored_policies = []
-    q_vec = np.array(query_list, dtype=np.float32)
+    # 2. Dense Vector Scoring
+    model = get_embedding_model()
+    query_vector = model.encode(query, normalize_embeddings=True)
+    q_vec = np.array(query_vector, dtype=np.float32)
     q_norm = np.linalg.norm(q_vec) or 1.0
 
-    for policy in policies:
-        emb = policy.embedding
-        if not emb:
+    dense_candidates: List[Dict[str, Any]] = []
+    for p in policies:
+        if not p.embedding:
             continue
-        p_vec = np.array(emb, dtype=np.float32)
+        p_vec = np.array(p.embedding, dtype=np.float32)
         p_norm = np.linalg.norm(p_vec) or 1.0
         cos_sim = float(np.dot(q_vec, p_vec) / (q_norm * p_norm))
-        scored_policies.append((policy, cos_sim))
+        sim = max(0.0, min(1.0, cos_sim))
 
-    # Sort descending by similarity
-    scored_policies.sort(key=lambda x: x[1], reverse=True)
-    top_records = scored_policies[:top_k]
-
-    return [
-        {
+        dense_candidates.append({
             "id": p.id,
             "title": p.title,
+            "breadcrumbs": getattr(p, "breadcrumbs", "") or p.title,
             "content": p.content,
             "format": p.format,
             "source_file": p.source_file,
             "version": p.version,
             "effective_from": p.effective_from.isoformat() if p.effective_from else None,
             "effective_to": p.effective_to.isoformat() if p.effective_to else None,
-            "similarity": round(max(0.0, min(1.0, sim)), 4),
+            "score": round(sim, 4),
+            "similarity": round(sim, 4),
             "source": f"[Source: {p.source_file}]",
-        }
-        for p, sim in top_records
-    ]
+        })
+
+    dense_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    if not use_hybrid:
+        return dense_candidates[:top_k]
+
+    # 3. Sparse Lexical Scoring (BM25 / Keyword Matching)
+    query_tokens = tokenize_text(query)
+    sparse_candidates: List[Dict[str, Any]] = []
+
+    for p in policies:
+        lex_score = compute_bm25_lexical_score(query_tokens, p.content, p.title)
+        if lex_score > 0.0 or not query_tokens:
+            sparse_candidates.append({
+                "id": p.id,
+                "title": p.title,
+                "breadcrumbs": getattr(p, "breadcrumbs", "") or p.title,
+                "content": p.content,
+                "format": p.format,
+                "source_file": p.source_file,
+                "version": p.version,
+                "effective_from": p.effective_from.isoformat() if p.effective_from else None,
+                "effective_to": p.effective_to.isoformat() if p.effective_to else None,
+                "score": lex_score,
+                "similarity": lex_score,
+                "source": f"[Source: {p.source_file}]",
+            })
+
+    sparse_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    # 4. Reciprocal Rank Fusion (RRF, k=60) -> Top-20 Candidates
+    top_candidates = reciprocal_rank_fusion(
+        dense_results=dense_candidates[:25],
+        sparse_results=sparse_candidates[:25],
+        k=60,
+        top_n=20,
+    )
+
+    # 5. Cross-Encoder Reranking -> Top-K
+    if use_reranker:
+        final_results = reranker.rerank(query, top_candidates, top_k=top_k)
+    else:
+        final_results = top_candidates[:top_k]
+
+    return final_results
+
+
+# Alias for compatibility
+retrieve_policies = search_policies

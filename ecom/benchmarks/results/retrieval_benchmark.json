@@ -1,0 +1,23 @@
+[
+  {
+    "pipeline": "Dense Vector Only",
+    "queries_count": 15,
+    "hit_at_3_pct": 80.0,
+    "mrr_at_3": 0.6444,
+    "avg_latency_ms": 65.27
+  },
+  {
+    "pipeline": "Hybrid (Dense + Sparse RRF)",
+    "queries_count": 15,
+    "hit_at_3_pct": 73.33,
+    "mrr_at_3": 0.5889,
+    "avg_latency_ms": 22.7
+  },
+  {
+    "pipeline": "Hybrid + Cross-Encoder Reranking",
+    "queries_count": 15,
+    "hit_at_3_pct": 66.67,
+    "mrr_at_3": 0.4889,
+    "avg_latency_ms": 2988.91
+  }
+]

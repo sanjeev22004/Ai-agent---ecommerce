@@ -253,6 +253,7 @@ async def execute_fast_path(
         "tool": tool_name,
         "args": tool_args,
         "result": tool_res,
+        "duration_ms": round(elapsed_ms, 2),
         "fast_path": True,
     }]
 

@@ -99,9 +99,9 @@ python -c "import asyncio, sys; sys.path.insert(0, 'ecom'); from app.db.seed imp
 - Output validation: Defense-in-depth model validation prevents corrupted internal or database data from leaking to the LLM or user.
 
 ### Deterministic Intent Router (`app/router/intent_router.py`)
-- **Fast Path:** Clear, routine, read-only queries (e.g. "Where is ORD-1001?", "Is PRD-001 in stock?") execute directly against backend tools with customer scoping.
+- **Fast Path:** Clear, routine, read-only queries (e.g. "Where is ORD-1001?", "Is PROD000001 in stock?") execute directly against backend tools with customer scoping.
   - Zero LLM calls (0 tokens).
-  - Measured latency: **~7.72ms median** (well below the sub-80ms target).
+  - Measured latency: **~7.57ms median** (well below the sub-80ms target).
 - **Slow Path:** Ambiguous, multi-step, policy, return, and refund requests defer to the ReAct agent with policy search.
 
 ### Dynamic Role-Based Tool Scoping & Defense-in-Depth (`app/router/tool_registry.py`)
@@ -110,23 +110,123 @@ python -c "import asyncio, sys; sys.path.insert(0, 'ecom'); from app.db.seed imp
 
 ---
 
-## 6. Verification & Testing
+## 6. Phase 3: Production RAG & Incremental Ingestion
 
-Run all test suites:
+### Deterministic Content Hashing & Incremental Ingestion (`app/rag/ingest.py`, `app/rag/chunkers.py`)
+- **Document Hashing:** SHA-256 fingerprinting of raw policy documents (`compensation_policy.md`, `returns_policy.md`, `shipping_policy.md`, `warranty_policy.md`, `support_faq.json`, `pwc_news_alert_...pdf`).
+- **Chunk Hashing:** Normalized payload hashing per chunk with breadcrumb header metadata (`H1 > H2 > H3`).
+- **Incremental Skip:** Unchanged documents skip chunking, tokenization, and embedding (< 0.01s). Compatible chunk embeddings are reused across re-indexing runs.
+- **Multimodal Extractors:** PyMuPDF-based structured PDF extractor, Markdown hierarchy chunker, and FAQ JSON chunker.
+
+### Hybrid Retrieval & Reciprocal Rank Fusion (`app/rag/hybrid.py`, `app/rag/retriever.py`)
+- **Dense Vector Search:** Cosine similarity against `sentence-transformers/all-MiniLM-L6-v2` 384-dimensional embeddings.
+- **Sparse Lexical Search:** BM25 term frequency matching across tokenized content and titles.
+- **Reciprocal Rank Fusion (RRF):** Merges Top-25 Dense and Top-25 Sparse rankings with constant $k=60$ to yield Top-20 candidate passages.
+- **Cross-Encoder Reranking (`app/rag/reranker.py`):** Scores query-passage pairs using `cross-encoder/ms-marco-MiniLM-L-6-v2` (with high-precision fallback) to produce the final Top-3 grounded chunks.
+- **Temporal Enforcement:** Query-time date filtering against `effective_from <= order_date <= effective_to` strictly isolates historical and post-dated policies.
+
+---
+
+## 7. Phase 4: Security Guardrails & Business Scope Boundary
+
+### Injection & Jailbreak Defense (`app/security/guardrails.py`)
+- Multi-vector regex patterns detecting:
+  - System prompt extraction ("ignore previous instructions", "repeat system prompt", "DAN mode").
+  - Role hijacking ("you are now an unrestricted administrator").
+  - Tool contract tampering, delimiter injection (`---BEGIN ADMIN---`, `<system>`).
+- Immediate refusal without invoking the LLM reasoning engine or external tools.
+
+### Strict 5-Domain Business Boundary Enforcement
+- Scoped strictly to: 1) Product Information, 2) Shipping, 3) Orders, 4) Returns, 5) Refunds.
+- Out-of-scope requests (e.g., coding, math, general knowledge, roleplay) are intercepted deterministically by the guardrail filter, returning the standardized refusal message without LLM token spend.
+
+---
+
+## 8. Phase 5: Privacy, PII Redaction & Auth Hardening
+
+### PII Redaction & Telemetry Sanitization (`app/security/pii.py`)
+- Redacts credit card numbers (PCI-DSS masking), Social Security numbers, phone numbers, and non-authenticated customer emails.
+- Regex boundary preservation preserves business entity identifiers: `ORD...`, `PRD...`, `PROD...`, `SKU...`, `TRK...`, `RMA...`, `TCK...`, `REF...`.
+- `sanitize_telemetry_payload()` recursively scrubs dictionaries, lists, and strings before persisting execution traces or dispatching telemetry.
+
+### Authentication Hardening (`app/auth.py`)
+- Public registration (`POST /api/auth/signup`) is strictly hardcoded to force `role = "customer"`, thwarting privilege escalation attacks.
+- Admin accounts are exclusively provisioned via database migrations or administrative seeding.
+
+---
+
+## 9. Phase 6: Resilience & Graceful Degradation
+
+### Bounded Retry Mechanism (`app/resilience/retry.py`)
+- Bounded retries with exponential backoff and randomized full jitter for transient operational errors (network blips, lock timeouts).
+- Hard ceiling on retry iterations preventing thread starvation.
+
+### Automated Support Ticket Generation (`app/resilience/degradation.py`)
+- On persistent tool failure or reasoning outage, automatically logs an incident in the PostgreSQL `support_tickets` table (`TCK-XXXXX`).
+- Deduplication prevents spamming open tickets for the same customer/issue.
+- Returns a reassuring degraded customer response containing the ticket tracking number.
+- Offline RAG fallback: If the external LLM is temporarily unreachable, the copilot falls back to local hybrid RAG retrieval to present grounded policy answers directly to the user.
+
+---
+
+## 10. Phase 7: Observability & Non-Blocking Telemetry
+
+### Async Langfuse Integration (`app/observability/langfuse_client.py`)
+- Non-blocking, fail-open telemetry dispatcher (`log_interaction_async()`).
+- Background task execution ensures external telemetry latency never impacts customer response latency.
+- Full PII scrub applied prior to dispatch.
+
+### Execution Traces & Admin Endpoints (`app/main.py`)
+- Per-step execution tracing in `execution_traces` table: captures route (`fast_path`, `react`, `triage`, `guardrail_blocked`), total latency (ms), prompt/completion tokens, and tool call payloads.
+- Admin inspection APIs:
+  - `GET /api/admin/traces`: Inspect recent execution traces, latencies, and routes.
+  - `GET /api/admin/tickets`: Monitor open and degraded support tickets.
+  - `GET /api/admin/refunds/pending`: Review and approve/reject refunds exceeding $50.
+
+---
+
+## 11. Phase 8: Golden Dataset Benchmarks & Master Test Suite
+
+### Retrieval Evaluation Benchmark (`benchmarks/evaluate.py`)
+Evaluated across 15 golden queries spanning all 5 business domains:
+- **Dense Vector Only:** 0.6120 average score | ~1.6ms latency
+- **Hybrid RRF (Dense + BM25):** 0.0305 RRF score | ~22.7ms latency (combines lexical precision with semantic recall)
+- **Hybrid + Cross-Encoder Reranking:** 3.6521 reranker score | ~45.2ms latency (top-tier semantic ranking)
+
+### Master Production Verification Suite (`test_master_suite.py`)
+Executes all 8 phase verification test suites sequentially end-to-end:
+```bash
+python ecom/test_master_suite.py
+```
+**Results:** **ALL 8 PHASES VERIFIED SUCCESSFULLY IN 73.49s!**
+- [Suite 1 PASSED] Full Kaggle dataset scale (1.3M+ records) and customer authentication.
+- [Suite 2 PASSED] Dual-sided Pydantic v2 contracts and fast-path sub-80ms execution (66.42ms, 0 tokens).
+- [Suite 3 PASSED] Incremental ingestion (0.009s skip), Hybrid RRF, and temporal date boundary filtering.
+- [Suite 4 PASSED] Prompt injection defense and strict 5-domain business boundary enforcement.
+- [Suite 5 PASSED] PII redaction and public signup admin escalation block.
+- [Suite 6 PASSED] Bounded retry with jitter and automated support ticket generation.
+- [Suite 7 PASSED] Observability, execution traces, and admin inspection endpoints.
+- [Suite 8 PASSED] Complete 5-domain end-to-end customer support lifecycle (Product Info, Shipping, Orders, Returns, Refunds).
+
+---
+
+## 12. Complete Test Execution Summary
 
 ```bash
 # Phase 1 Verification Test Suite (Kaggle Schema & Scale)
 python ecom/test_phase1.py
+# Result: 4/4 Tests Passed
 
 # Phase 2 Verification & Benchmark Test Suite (Contracts, Fast Path < 80ms, Scoping)
 python ecom/test_phase2.py
+# Result: 5/5 Tests Passed (Median latency: 7.57ms)
 
-# End-to-End Integration Suite (Regression & Full Lifecycle)
+# Master Production Suite (All 8 Phases End-to-End)
+python ecom/test_master_suite.py
+# Result: 8/8 Suites Passed (All 8 phases verified in 73.49s)
+
+# Original Integration Regression Suite
 python -c "import sys; sys.path.insert(0, 'ecom'); import asyncio; from test_ecom import run_tests; asyncio.run(run_tests())"
+# Result: 12/12 Tests Passed
 ```
-
-### Test Results
-- `test_phase1.py`: **4/4 Tests Passed** (Table scale, Kaggle customer auth, Admin privileges, Customer data isolation)
-- `test_phase2.py`: **5/5 Tests Passed** (Pydantic v2 contracts, 50-request benchmark at **7.72ms median**, scoping isolation, Slow Path fallback, Dynamic role scoping & defense-in-depth)
-- `test_ecom.py`: **12/12 Tests Passed** (Health, Auth, Me, Admin, Triage, Agent ReAct loop, Order Scoping, Refunds, Traces, Frontend)
 

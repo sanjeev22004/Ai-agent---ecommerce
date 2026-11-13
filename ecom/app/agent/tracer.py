@@ -76,7 +76,8 @@ class ActiveTrace:
         model_name: str = "openai/gpt-oss-120b",
         user_details: Optional[Dict[str, Any]] = None,
     ):
-        self.trace_id = f"trc-{uuid.uuid4().hex[:12]}"
+        # Generate a standard 32-character hex UUID compliant with OpenTelemetry and Langfuse trace standards
+        self.trace_id = uuid.uuid4().hex
         self.session_id = session_id
         self.user_message = user_message
         self.model_name = model_name

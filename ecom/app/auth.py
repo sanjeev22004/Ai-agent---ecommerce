@@ -221,25 +221,16 @@ async def signup(
     name = request.name.strip()
     email = request.email.strip().lower()
     password = request.password.strip()
-    role = (request.role or "customer").strip().lower()
 
     if not name:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User ID or Name is required.",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Name is required.")
     if not email or "@" not in email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A valid email address is required.",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A valid email is required.")
     if len(password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 6 characters long.",
-        )
-    if role not in ("customer", "admin"):
-        role = "customer"
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 6 characters long.")
+
+    # Security Hardening: Public signup is strictly restricted to 'customer' role.
+    role = "customer"
 
     # Check for existing email or name
     existing_user = await session.execute(

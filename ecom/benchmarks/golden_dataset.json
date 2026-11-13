@@ -1,0 +1,123 @@
+[
+  {
+    "id": "Q01",
+    "domain": "Returns",
+    "query": "What is the return window for electronics and laptops?",
+    "expected_keywords": ["electronics", "14 days", "return", "refund"],
+    "expected_source": "returns_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q02",
+    "domain": "Returns",
+    "query": "Can I return an item without original packaging?",
+    "expected_keywords": ["packaging", "original", "box", "restocking fee"],
+    "expected_source": "returns_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q03",
+    "domain": "Refunds",
+    "query": "How long does it take for a refund to show on my credit card?",
+    "expected_keywords": ["refund", "business days", "credit card", "bank"],
+    "expected_source": "compensation_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q04",
+    "domain": "Refunds",
+    "query": "Why does my refund require administrator approval?",
+    "expected_keywords": ["50", "admin", "approval", "threshold"],
+    "expected_source": "returns_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q05",
+    "domain": "Shipping",
+    "query": "What is the standard delivery SLA and shipping delay compensation?",
+    "expected_keywords": ["sla", "delivery", "delay", "shipping fee"],
+    "expected_source": "shipping_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q06",
+    "domain": "Shipping",
+    "query": "How are damaged in transit shipments handled?",
+    "expected_keywords": ["damaged", "transit", "carrier", "replacement"],
+    "expected_source": "shipping_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q07",
+    "domain": "Product Information",
+    "query": "What manufacturer warranty coverage applies to hardware?",
+    "expected_keywords": ["warranty", "hardware", "months", "repair"],
+    "expected_source": "warranty_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q08",
+    "domain": "Product Information",
+    "query": "Is accidental physical damage covered under warranty?",
+    "expected_keywords": ["accidental", "damage", "exclusion", "warranty"],
+    "expected_source": "warranty_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q09",
+    "domain": "Orders",
+    "query": "Can I cancel an order that is already in shipped status?",
+    "expected_keywords": ["cancel", "shipped", "processing", "transit"],
+    "expected_source": "shipping_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q10",
+    "domain": "Orders",
+    "query": "How do I track my package using a tracking number?",
+    "expected_keywords": ["track", "tracking number", "carrier", "status"],
+    "expected_source": "support_faq.json",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q11",
+    "domain": "Returns",
+    "query": "Who pays for return shipping labels?",
+    "expected_keywords": ["prepaid", "label", "shipping", "defective"],
+    "expected_source": "returns_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q12",
+    "domain": "Refunds",
+    "query": "Are restocking fees charged on opened items?",
+    "expected_keywords": ["restocking", "fee", "15%", "opened"],
+    "expected_source": "returns_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q13",
+    "domain": "Shipping",
+    "query": "Do you offer international shipping or express delivery?",
+    "expected_keywords": ["express", "international", "shipping", "days"],
+    "expected_source": "shipping_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q14",
+    "domain": "Shipping",
+    "query": "What happens if a package is lost by the carrier?",
+    "expected_keywords": ["lost", "claim", "replacement", "refund"],
+    "expected_source": "compensation_policy.md",
+    "order_date": "2024-06-01"
+  },
+  {
+    "id": "Q15",
+    "domain": "Product Information",
+    "query": "How do I check if an item is authentic and under warranty?",
+    "expected_keywords": ["serial", "authentic", "warranty", "catalog"],
+    "expected_source": "warranty_policy.md",
+    "order_date": "2024-06-01"
+  }
+]
+

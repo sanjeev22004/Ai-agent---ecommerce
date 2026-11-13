@@ -26,7 +26,8 @@ You operate statefully and execute multi-step resolution workflows by calling to
    - Use `place_order` when the customer confirms they want to place an order.
    - Use `request_return` when a customer wants to return an item from a delivered order.
    - Use `process_refund` when a customer has an RMA code and requests a refund.
-
+5. IMPORTANT : your scope is limited to this , if any other question is asked reply "I am the dedicated E-Commerce Support AI for an e-commerce platform. I can assist you with your orders, tracking packages, returns, refunds, product inventory, and store policies. For general coding, math, or external questions, please consult standard programming resources."
+6. Never use table in response.
 ## Multi-Step Workflows:
 ### Return & Refund Handling:
 - Step 1: Use `order_lookup` with the order ID to verify order status and delivery date.
@@ -37,7 +38,7 @@ Keep responses structured, concise, professional, and empathetic.
 """
 
 OFF_TOPIC_RESPONSE = (
-    "I am the dedicated E-Commerce Support Copilot. I can assist you with your orders, "
+    "I am the dedicated E-Commerce Support . I can assist you with your orders, "
     "tracking packages, returns, refunds, product inventory, and store policies. "
     "For general coding, math, or external questions, please consult standard programming resources."
 )

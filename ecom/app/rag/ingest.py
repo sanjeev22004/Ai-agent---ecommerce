@@ -1,21 +1,35 @@
-"""Policy ingestion and embedding pipeline for ecom.
+"""Production-Grade Incremental Policy Ingestion Pipeline with Content Hashing.
 
-Chunks markdown (.md), JSON (.json), and PDF (.pdf) documents from data/policies/
-and embeds them into pgvector.
+Features:
+1. Deterministic SHA-256 content hashing of raw source documents.
+2. Ingestion metadata tracking in `ingestion_metadata` table.
+3. Incremental change detection:
+   - Unchanged document: Skip parsing, chunking, and embedding entirely.
+   - Changed/New document: Parse into hierarchy-aware chunks with breadcrumbs, embed, and upsert.
+   - Deleted document: Remove obsolete policy chunks from DB.
+4. Preserves vector storage and embedding model version compatibility.
 """
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from app.config import settings, POLICIES_DIR
-from app.db.models import Policy
+from app.db.models import Policy, IngestionMetadata
+from app.rag.chunkers import (
+    MarkdownHierarchyChunker,
+    JsonKnowledgeChunker,
+    StructuredPdfExtractor,
+    DocumentChunk,
+    compute_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,160 +49,148 @@ def get_embedding_model() -> SentenceTransformer:
     return _embedding_model
 
 
-def chunk_text(text: str, chunk_size: int = settings.CHUNK_SIZE, overlap: int = settings.CHUNK_OVERLAP) -> List[str]:
-    """Split text into semantic paragraph-aware overlapping chunks."""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks: List[str] = []
-    current_chunk = ""
-
-    for para in paragraphs:
-        if not current_chunk:
-            current_chunk = para
-        elif len(current_chunk) + len(para) + 2 <= chunk_size:
-            current_chunk += "\n\n" + para
-        else:
-            chunks.append(current_chunk)
-            if overlap > 0 and len(current_chunk) > overlap:
-                overlap_text = current_chunk[-overlap:]
-                current_chunk = overlap_text + "\n\n" + para
-            else:
-                current_chunk = para
-
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-
-    return chunks if chunks else [text.strip()]
+def calculate_file_sha256(file_path: Path) -> str:
+    """Compute deterministic SHA-256 hash of a file's raw bytes."""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
-async def ingest_policies(session: AsyncSession, policies_dir: Optional[Path] = None) -> int:
-    """Read all markdown, JSON, and PDF files in policies_dir, chunk, embed, and store in DB."""
+async def ingest_policies(
+    session: AsyncSession,
+    policies_dir: Optional[Path] = None,
+    force_reembed: bool = False,
+) -> int:
+    """Incrementally discover, hash, chunk, embed, and store policies."""
     target_dir = policies_dir or POLICIES_DIR
     if not target_dir.exists():
         logger.warning("Policies directory %s does not exist. Skipping ingestion.", target_dir)
         return 0
 
     model = get_embedding_model()
-    policy_records: List[Policy] = []
+    md_chunker = MarkdownHierarchyChunker(max_chunk_size=settings.CHUNK_SIZE, chunk_overlap=settings.CHUNK_OVERLAP)
+    json_chunker = JsonKnowledgeChunker()
+    pdf_extractor = StructuredPdfExtractor()
+
     base_effective_date = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
 
-    # 1. Process Markdown files (.md)
-    for md_file in sorted(target_dir.glob("*.md")):
-        logger.info("Ingesting markdown policy: %s", md_file.name)
-        text = md_file.read_text(encoding="utf-8")
-        title = md_file.stem.replace("_", " ").title()
+    # 1. Fetch current ingestion metadata
+    meta_res = await session.execute(select(IngestionMetadata))
+    existing_meta: Dict[str, IngestionMetadata] = {
+        m.document_id: m for m in meta_res.scalars().all()
+    }
 
-        first_line = text.strip().split("\n")[0]
-        if first_line.startswith("# "):
-            title = first_line.lstrip("# ").strip()
+    # Discover policy files (.md, .json, .pdf)
+    discovered_files: List[Path] = []
+    for ext in ("*.md", "*.json", "*.pdf"):
+        discovered_files.extend(sorted(target_dir.glob(ext)))
 
-        chunks = chunk_text(text)
-        embeddings = model.encode(chunks, normalize_embeddings=True)
+    discovered_doc_ids: Set[str] = {f.name for f in discovered_files}
 
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            chunk_title = f"{title} (Part {i + 1})" if len(chunks) > 1 else title
-            record = Policy(
-                title=chunk_title,
-                content=chunk,
-                format="markdown",
-                source_file=md_file.name,
-                version="1.0",
-                effective_from=base_effective_date,
-                effective_to=None,
-                embedding=emb.tolist(),
+    # 2. Detect deleted source documents and prune obsolete chunks
+    for doc_id, meta in list(existing_meta.items()):
+        if doc_id not in discovered_doc_ids:
+            logger.info("Source document '%s' was deleted. Removing obsolete chunks...", doc_id)
+            await session.execute(delete(Policy).where(Policy.source_file == doc_id))
+            await session.execute(delete(IngestionMetadata).where(IngestionMetadata.document_id == doc_id))
+
+    total_chunks_processed = 0
+
+    # 3. Process each discovered file
+    for file_path in discovered_files:
+        doc_id = file_path.name
+        current_hash = calculate_file_sha256(file_path)
+        stored_meta = existing_meta.get(doc_id)
+
+        # Change Detection: Check if document is unchanged and model version matches
+        if (
+            not force_reembed
+            and stored_meta is not None
+            and stored_meta.document_hash == current_hash
+            and stored_meta.embedding_model == settings.EMBEDDING_MODEL
+        ):
+            # Check if chunks actually exist in DB
+            chunk_check = await session.execute(
+                select(Policy.id).where(Policy.source_file == doc_id).limit(1)
             )
-            policy_records.append(record)
+            if chunk_check.scalar_one_or_none() is not None:
+                logger.info("Document '%s' is unchanged (SHA-256 match). Skipping embedding.", doc_id)
+                continue
 
-    # 2. Process JSON FAQ files (.json)
-    for json_file in sorted(target_dir.glob("*.json")):
-        logger.info("Ingesting JSON knowledge: %s", json_file.name)
-        try:
-            data = json.loads(json_file.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                items_to_embed: List[str] = []
-                temp_records: List[dict] = []
+        logger.info("Ingesting new/modified document: %s (SHA-256: %s...)", doc_id, current_hash[:12])
 
-                for item in data:
-                    q = item.get("question", "")
-                    a = item.get("answer", "")
-                    tags = ", ".join(item.get("tags", []))
-                    content = f"Question: {q}\nAnswer: {a}\nRelated Tags: {tags}"
-                    title = f"FAQ: {q}"
+        # Parse into chunks
+        chunks: List[DocumentChunk] = []
+        if file_path.suffix.lower() == ".md":
+            text = file_path.read_text(encoding="utf-8")
+            chunks = md_chunker.chunk(text, source_file=doc_id)
+        elif file_path.suffix.lower() == ".json":
+            text = file_path.read_text(encoding="utf-8")
+            chunks = json_chunker.chunk(text, source_file=doc_id)
+        elif file_path.suffix.lower() == ".pdf":
+            chunks = pdf_extractor.chunk(file_path)
 
-                    items_to_embed.append(content)
-                    temp_records.append({
-                        "title": title,
-                        "content": content,
-                        "format": "json",
-                        "source_file": json_file.name,
-                        "version": "1.0",
-                    })
-
-                if items_to_embed:
-                    embeddings = model.encode(items_to_embed, normalize_embeddings=True)
-                    for info, emb in zip(temp_records, embeddings):
-                        record = Policy(
-                            title=info["title"],
-                            content=info["content"],
-                            format=info["format"],
-                            source_file=info["source_file"],
-                            version=info["version"],
-                            effective_from=base_effective_date,
-                            effective_to=None,
-                            embedding=emb.tolist(),
-                        )
-                        policy_records.append(record)
-        except Exception as e:
-            logger.error("Failed to parse JSON policy %s: %s", json_file.name, e)
-
-    # 3. Process PDF files (.pdf)
-    for pdf_file in sorted(target_dir.glob("*.pdf")):
-        logger.info("Checking PDF policy: %s", pdf_file.name)
-        pdf_text = ""
-        try:
-            import fitz
-            doc = fitz.open(str(pdf_file))
-            for page in doc:
-                pdf_text += page.get_text() + "\n\n"
-        except Exception:
-            try:
-                from pypdf import PdfReader
-                reader = PdfReader(str(pdf_file))
-                for page in reader.pages:
-                    pdf_text += (page.extract_text() or "") + "\n\n"
-            except Exception as e:
-                logger.error("Error reading PDF %s: %s", pdf_file.name, e)
-
-        pdf_text = pdf_text.strip()
-        if not pdf_text:
-            logger.warning(
-                "PDF '%s' contains no extractable digital text layer (scanned or image-only PDF). "
-                "Text extraction returned 0 characters.",
-                pdf_file.name,
-            )
+        if not chunks:
+            logger.warning("No chunks extracted from document: %s", doc_id)
             continue
 
-        title = pdf_file.stem.replace("_", " ").title()
-        chunks = chunk_text(pdf_text)
-        embeddings = model.encode(chunks, normalize_embeddings=True)
+        # Embed all extracted chunks
+        chunk_texts = [c.content for c in chunks]
+        embeddings = model.encode(chunk_texts, normalize_embeddings=True)
 
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            chunk_title = f"{title} (Part {i + 1})" if len(chunks) > 1 else title
-            record = Policy(
-                title=chunk_title,
-                content=chunk,
-                format="pdf",
-                source_file=pdf_file.name,
-                version="1.0",
+        # Clear old chunks for this document
+        await session.execute(delete(Policy).where(Policy.source_file == doc_id))
+
+        # Insert fresh chunks with breadcrumbs and chunk hashes
+        records: List[Policy] = []
+        for chunk_obj, emb in zip(chunks, embeddings):
+            rec = Policy(
+                title=chunk_obj.title,
+                content=chunk_obj.content,
+                format=chunk_obj.format,
+                source_file=doc_id,
+                version="2.0",
                 effective_from=base_effective_date,
                 effective_to=None,
                 embedding=emb.tolist(),
+                document_hash=current_hash,
+                chunk_hash=chunk_obj.chunk_hash,
+                breadcrumbs=chunk_obj.breadcrumbs,
             )
-            policy_records.append(record)
+            records.append(rec)
 
-    # Clean existing policies and insert fresh
-    await session.execute(delete(Policy))
-    session.add_all(policy_records)
+        session.add_all(records)
+        total_chunks_processed += len(records)
+
+        # Update IngestionMetadata
+        file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
+        if stored_meta:
+            stored_meta.document_hash = current_hash
+            stored_meta.embedding_model = settings.EMBEDDING_MODEL
+            stored_meta.ingested_at = now_utc
+            stored_meta.last_modified_at = file_mtime
+            stored_meta.ingestion_status = "success"
+        else:
+            new_meta = IngestionMetadata(
+                document_id=doc_id,
+                source_name=file_path.stem.replace("_", " ").title(),
+                document_hash=current_hash,
+                content_version="2.0",
+                embedding_model=settings.EMBEDDING_MODEL,
+                embedding_model_version="1.0",
+                ingested_at=now_utc,
+                last_modified_at=file_mtime,
+                ingestion_status="success",
+            )
+            session.add(new_meta)
+
     await session.commit()
 
-    logger.info("Successfully ingested %d policy chunks into pgvector database.", len(policy_records))
-    return len(policy_records)
+    # Query total active policy chunks
+    count_res = await session.execute(select(Policy.id))
+    total_active_chunks = len(count_res.scalars().all())
+    logger.info("Policy ingestion complete: %d chunks active in database.", total_active_chunks)
+    return total_active_chunks

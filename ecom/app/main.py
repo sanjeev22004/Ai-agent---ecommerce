@@ -22,7 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, require_admin, router as auth_router
 from app.config import settings, STATIC_DIR
-from app.db.models import ChatMessage, ChatSession, ExecutionTrace, Order, Refund, Return, User
+from app.db.models import ChatMessage, ChatSession, ExecutionTrace, Order, Refund, Return, User, SupportTicket
 from app.db.seed import seed_database
 from app.db.session import get_db_session, init_db
 from app.agent.orchestrator import orchestrator
@@ -318,6 +318,31 @@ async def list_execution_traces(
             "created_at": t.created_at.isoformat(),
         })
     return {"count": len(output), "traces": output}
+
+
+@app.get("/api/admin/tickets")
+async def list_support_tickets(
+    limit: int = 20,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Admin endpoint: retrieve auto-generated support tickets."""
+    stmt = select(SupportTicket).order_by(desc(SupportTicket.created_at)).limit(limit)
+    res = await db.execute(stmt)
+    tickets = res.scalars().all()
+    output = [
+        {
+            "ticket_id": t.id,
+            "customer_id": t.customer_id,
+            "request_summary": t.request_summary,
+            "failure_category": t.failure_category,
+            "failed_tool": t.failed_tool,
+            "status": t.status,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
+        for t in tickets
+    ]
+    return {"count": len(output), "tickets": output}
 
 
 @app.get("/api/health")
