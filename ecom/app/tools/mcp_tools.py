@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import random
+import uuid
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -302,27 +303,34 @@ async def tool_place_order(
 
     order_id = f"ORD-{random.randint(1000, 9999)}"
     tracking_no = f"TRK-{random.randint(10000000, 99999999)}"
+    now_utc = datetime.now(timezone.utc)
 
+    cust_id = getattr(user, "customer_id", None) or user.id
     new_order = Order(
         id=order_id,
-        customer_id=user.id,
+        customer_id=cust_id,
         customer_email=user.email,
+        order_date=now_utc,
         status="processing",
         total_amount=round(total_amount, 2),
         tracking_number=tracking_no,
-        delivery_date=None,
-        created_at=datetime.now(timezone.utc),
+        actual_delivery_date=None,
+        created_at=now_utc,
     )
     session.add(new_order)
     await session.flush()
 
     for item_data in items_to_create:
+        line_id = f"OL-{uuid.uuid4().hex[:10].upper()}" if 'uuid' in dir() else f"OL-{random.randint(10000000, 99999999)}"
+        line_net = round(item_data["quantity"] * item_data["unit_price"], 2)
         order_item = OrderItem(
+            id=line_id,
             order_id=order_id,
             product_id=item_data["product_id"],
             product_name=item_data["product_name"],
             quantity=item_data["quantity"],
             unit_price=item_data["unit_price"],
+            net_amount=line_net,
         )
         session.add(order_item)
 

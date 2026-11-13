@@ -77,6 +77,15 @@ async def init_db() -> None:
     logger.info("Database initialized successfully.")
 
 
+async def reset_db() -> None:
+    """Drop and re-create all database tables."""
+    logger.info("Dropping all existing database tables...")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    logger.info("Re-creating all database tables...")
+    await init_db()
+
+
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency for yielding database sessions."""
     async with AsyncSessionLocal() as session:

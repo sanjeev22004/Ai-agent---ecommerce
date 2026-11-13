@@ -44,6 +44,7 @@ class SignupRequest(BaseModel):
 
 class UserOut(BaseModel):
     id: str
+    customer_id: Optional[str] = None
     name: str
     email: str
     role: str
@@ -197,6 +198,7 @@ async def login(
     access_token = create_access_token(
         data={
             "user_id": user.id,
+            "customer_id": user.customer_id,
             "email": user.email,
             "role": user.role,
             "name": user.name,
@@ -271,6 +273,7 @@ async def signup(
     access_token = create_access_token(
         data={
             "user_id": new_user.id,
+            "customer_id": new_user.customer_id,
             "email": new_user.email,
             "role": new_user.role,
             "name": new_user.name,
