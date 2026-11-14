@@ -58,7 +58,7 @@ OUT_OF_DOMAIN_PATTERNS = re.compile(
 )
 
 SCOPE_REFUSAL_MESSAGE = (
-    "I am your dedicated E-Commerce Support Copilot. I can assist you exclusively with "
+    "I am your dedicated E-Commerce Support Assistant. I can assist you exclusively with "
     "our five core customer services: 1) Product Information, 2) Shipping & Tracking, "
     "3) Orders, 4) Returns, and 5) Refunds. For inquiries outside these areas, please consult "
     "an appropriate resource."
@@ -69,8 +69,8 @@ INJECTION_REFUSAL_MESSAGE = (
     "developer policies, or bypass safety guardrails. How can I help you with your order or product today?"
 )
 
-INTENT_SAFETY_SYSTEM_PROMPT = """You are an Intent and Business Scope Classifier for an E-Commerce Customer Support Copilot.
-The copilot is STRICTLY RESTRICTED to e-commerce customer support across these 5 domains:
+INTENT_SAFETY_SYSTEM_PROMPT = """You are an Intent and Business Scope Classifier for an E-Commerce Customer Support Assistant.
+The assistant is STRICTLY RESTRICTED to e-commerce customer support across these 5 domains:
 1. Product Information (specifications, inventory availability, recommendations, pricing, warranty, discounts)
 2. Shipping & Tracking (shipping policy, carrier info, delivery estimates, tracking numbers, shipping delays)
 3. Orders (order status, order details, cancellation, modifications, invoice, items ordered)

@@ -129,7 +129,7 @@ class AsyncLangfuseClient:
                         with propagate_attributes(
                             user_id=str(user_id),
                             session_id=str(session_id),
-                            tags=["ecommerce-copilot", route, status],
+                            tags=["ecommerce-support", route, status],
                             trace_name=f"ecom-chat-{route}",
                         ):
                             # Hierarchy: Add child tool/retriever observations with accurate duration

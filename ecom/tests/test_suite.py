@@ -388,7 +388,7 @@ async def verify_admin_approval_and_frontend():
         # 4. Frontend index.html serving
         html_res = await client.get("/")
         assert html_res.status_code == 200
-        assert "ecom copilot" in html_res.text.lower() or "copilot" in html_res.text.lower()
+        assert "ecom support" in html_res.text.lower() or "support" in html_res.text.lower()
 
     logger.info("[Suite 9 PASSED] Admin refund approval and frontend SPA verified.")
 

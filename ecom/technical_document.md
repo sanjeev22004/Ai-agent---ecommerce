@@ -1,5 +1,5 @@
 # Comprehensive Technical Architecture & Design Document
-## Agentic AI E-Commerce Support Resolution Copilot
+## Agentic AI E-Commerce Support Resolution Agent
 
 **Version:** 2.0.0  
 **Status:** Production-Ready Verification Complete  
@@ -9,7 +9,7 @@
 
 ## 1. Executive Technical Summary & System Architecture
 
-The **Agentic AI E-Commerce Support Resolution Copilot** is an enterprise-grade customer resolution system designed to resolve complex, multi-step customer inquiries across five core e-commerce domains: **Product Information, Shipping, Orders, Returns, and Refunds**.
+The **Agentic AI E-Commerce Support Resolution Agent** is an enterprise-grade customer resolution system designed to resolve complex, multi-step customer inquiries across five core e-commerce domains: **Product Information, Shipping, Orders, Returns, and Refunds**.
 
 Traditional support bots rely either on rigid intent decision trees (which fail on complex multi-step reasoning) or direct single-prompt LLM generation (which suffers from hallucinations, zero grounding, lack of transactional safety, and slow response times). This architecture unifies a **Two-Tier Intent Router** with a **Stateful ReAct Agent Loop**, a **Model Context Protocol (MCP)** tool layer, and a **Production-Grade Hybrid RAG Pipeline** with temporal boundary enforcement.
 

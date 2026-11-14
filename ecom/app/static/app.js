@@ -1,5 +1,5 @@
 /**
- * ecom copilot — Frontend Application State & Client Logic
+ * ecom support — Frontend Application State & Client Logic
  */
 
 const STATE = {
