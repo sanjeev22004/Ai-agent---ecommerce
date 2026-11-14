@@ -141,7 +141,7 @@ python benchmarks/evaluate.py
 ```
 
 ### Run Intent Safety & Guardrails Test Suite
-Verifies prompt injection defense, baseless question refusal, and 5-domain boundary enforcement:
+Verifies prompt injection defense, baseless question refusal, and domain boundary enforcement:
 ```bash
 python tests/test_intent_safety_guardrails.py
 ```
