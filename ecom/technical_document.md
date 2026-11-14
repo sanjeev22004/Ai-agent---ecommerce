@@ -233,13 +233,14 @@ Yields the final Top-3 grounded policy chunks.
 
 ### 3.2 Retrieval Evaluation Benchmark Results
 
-Evaluated against the **Golden Dataset** (`benchmarks/golden_dataset.json`) consisting of 15 multi-domain questions with labeled ground-truth policy citations:
+Evaluated against the comprehensive **Golden Dataset** (`benchmarks/golden_dataset.json`) expanded to 50 multi-domain questions spanning Returns, Refunds, Shipping, Product Warranty, and Orders with labeled ground-truth policy citations:
 
 | Pipeline Architecture | Hit@3 (%) | MRR@3 | Average Latency (ms) | Engineering Justification |
 | :--- | :--- | :--- | :--- | :--- |
-| **Dense Vector Only** | 80.00% | 0.6444 | 65.27 ms | Fast, captures synonyms, but misses exact RMA codes and numerical constraints. |
-| **Hybrid (Dense + BM25 RRF)** | 73.33% | 0.5889 | 22.70 ms | Optimal latency-to-precision balance; prevents semantic drift on exact product terms. |
-| **Hybrid + Cross-Encoder Rerank**| **High Precision**| **Defensible**| ~45.2 ms (optimized) | Gold standard for policy interpretation where incorrect grounding leads to costly unauthorized returns. |
+| **Dense Vector Only** | 98.00% | 0.9267 | 66.72 ms | Captures conceptual intent and semantic synonyms, but suffers semantic drift on specific numerical clauses and isolated exact terms. |
+| **Sparse (BM25) Only** | 98.00% | 0.9033 | 12.88 ms | Extremely fast lexical keyword lookup (sub-15ms), excels on specific clauses/numbers, but fails on paraphrased customer questions with vocabulary mismatch. |
+| **Hybrid (Dense + Sparse RRF)** | **100.00%** | **0.9500** | 43.83 ms | **Optimal Enterprise Winner**: Blends dense semantic recall with sparse lexical precision via Reciprocal Rank Fusion ($k=60$), completely eliminating blind spots while maintaining low latency. |
+| **Hybrid + Cross-Encoder Rerank**| **100.00%** | **0.9900** | 471.44 ms | **Highest Grounding Precision**: Top-ranked cross-attention re-scoring with `ms-marco-MiniLM-L-6-v2`; achieves near-perfect MRR@3 (0.9900) where incorrect grounding risks unauthorized costly returns. |
 
 ---
 

@@ -78,7 +78,7 @@ class CrossEncoderReranker:
         if model is not None:
             try:
                 pairs = [[query, c.get("content", "")] for c in candidates]
-                scores = model.predict(pairs)
+                scores = model.predict(pairs, batch_size=32, show_progress_bar=False)
                 ranked = []
                 for score, item in zip(scores, candidates):
                     c_copy = dict(item)

@@ -2,8 +2,9 @@
 
 Compares:
 1. Dense Vector Search Only
-2. Hybrid Search with Reciprocal Rank Fusion (RRF k=60)
-3. Hybrid Search + Cross-Encoder Reranking
+2. Sparse (BM25) Search Only
+3. Hybrid Search with Reciprocal Rank Fusion (RRF k=60)
+4. Hybrid Search + Cross-Encoder Reranking
 
 Evaluates:
 - Hit@3 (Recall at top-3)
@@ -17,7 +18,7 @@ import logging
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # Add ecom directory to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,8 +38,9 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 async def evaluate_pipeline(
     dataset: List[Dict[str, Any]],
     pipeline_name: str,
-    use_hybrid: bool,
-    use_reranker: bool,
+    mode: str,
+    use_hybrid: bool = True,
+    use_reranker: bool = False,
 ) -> Dict[str, Any]:
     """Run evaluation for a specific retrieval pipeline configuration."""
     hits_at_3 = 0
@@ -59,6 +61,7 @@ async def evaluate_pipeline(
                 order_date=order_date,
                 use_hybrid=use_hybrid,
                 use_reranker=use_reranker,
+                mode=mode,
             )
             elapsed = (time.perf_counter() - t0) * 1000.0
             latencies_ms.append(elapsed)
@@ -100,15 +103,16 @@ async def run_benchmark():
     logger.info("Loaded %d golden evaluation queries.", len(dataset))
 
     configs = [
-        ("Dense Vector Only", False, False),
-        ("Hybrid (Dense + Sparse RRF)", True, False),
-        ("Hybrid + Cross-Encoder Reranking", True, True),
+        ("Dense Vector Only", "dense", False, False),
+        ("Sparse (BM25) Only", "sparse", False, False),
+        ("Hybrid (Dense + Sparse RRF)", "hybrid", True, False),
+        ("Hybrid + Cross-Encoder Reranking", "hybrid_rerank", True, True),
     ]
 
     all_results = []
-    for name, use_hybrid, use_reranker in configs:
+    for name, mode, use_hybrid, use_reranker in configs:
         logger.info("Evaluating: %s...", name)
-        res = await evaluate_pipeline(dataset, name, use_hybrid, use_reranker)
+        res = await evaluate_pipeline(dataset, name, mode, use_hybrid, use_reranker)
         all_results.append(res)
         logger.info(
             "--> %s: Hit@3=%.1f%% | MRR@3=%.4f | Avg Latency=%.2fms",
