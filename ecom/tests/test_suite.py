@@ -1,14 +1,15 @@
-"""Master Comprehensive Production Verification Suite.
+"""Comprehensive Master Production Verification Suite for ecom.
 
-Validates all 8 phases of the Production-Grade Agentic E-Commerce Support Copilot:
-- Phase 1: Database Architecture, Kaggle Schema (1.3M records), Credentials
-- Phase 2: Strict Dual-Sided Pydantic Contracts, Two-Tier Router, Role Scoping
-- Phase 3: Production RAG, Incremental Hashing, Hybrid RRF, Temporal Filtering
-- Phase 4: Security Guardrails, Injection Defense, 5-Domain Business Boundary
-- Phase 5: Privacy, PII Redaction, Admin Signup Hardening
-- Phase 6: Resilience, Bounded Retries, Auto Support Ticket Creation
-- Phase 7: Observability, Execution Traces, Fail-Open Langfuse Telemetry
-- Phase 8: End-to-End 5-Domain Customer Resolution Lifecycle
+Consolidates all phases into a clean, unified test harness:
+- Suite 1: Phase 1 Database Scale, Schema & Kaggle Authentication
+- Suite 2: Phase 2 Strict Dual-Sided Pydantic Contracts, Two-Tier Router & Role Scoping
+- Suite 3: Phase 3 Incremental Policy Ingestion, Hybrid RRF & Temporal Filtering
+- Suite 4: Phase 4 Security Guardrails & 5-Domain Business Boundary
+- Suite 5: Phase 5 Privacy, PII Redaction & Admin Signup Hardening
+- Suite 6: Phase 6 Resilience, Bounded Retries & Automated Support Tickets
+- Suite 7: Phase 7 Observability, Admin Traces & Support Tickets API
+- Suite 8: Phase 8 End-to-End 5-Domain Customer Resolution Lifecycle
+- Suite 9: Admin Refund Approval Workflow & Frontend Static Assets Serving
 """
 
 import asyncio
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
-import statistics
+import sys
 import time
 import uuid
 
@@ -25,22 +26,25 @@ import httpx
 from httpx import ASGITransport
 import pydantic
 
+# Ensure ecom root is in sys.path
+ECOM_ROOT = Path(__file__).resolve().parent.parent
+if str(ECOM_ROOT) not in sys.path:
+    sys.path.insert(0, str(ECOM_ROOT))
+
 from app.main import app
-from app.db.session import AsyncSessionLocal
-from app.db.models import User, Policy, IngestionMetadata, SupportTicket, ExecutionTrace
+from app.db.session import AsyncSessionLocal, init_db
+from app.db.models import User, Policy, IngestionMetadata, SupportTicket, ExecutionTrace, Refund
 from app.router.intent_router import DeterministicIntentRouter, RouteTarget, FastPathIntent
 from app.router.tool_registry import get_tools_for_role, validate_tool_authorization
-from app.rag.ingest import ingest_policies, calculate_file_sha256
-from app.rag.retriever import search_policies
 from app.security.guardrails import SecurityGuardrails
 from app.security.pii import redact_pii_text
 from app.resilience.retry import execute_with_bounded_retry
 from app.resilience.degradation import create_support_ticket, build_degraded_response
-from app.contracts.tool_contracts import OrderLookupOutput, InventoryCheckOutput
+from app.contracts.tool_contracts import OrderLookupOutput, InventoryCheckOutput, OrderItemInput
 from app.tools.mcp_tools import execute_tool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("ecom.master_suite")
+logger = logging.getLogger("ecom.test_suite")
 
 
 @contextmanager
@@ -83,7 +87,6 @@ async def verify_phase2_contracts_and_routing():
     logger.info("--> [Suite 2] Verifying Phase 2: Contracts, Two-Tier Router & Role Scoping...")
     # Contracts
     with assert_raises(pydantic.ValidationError):
-        from app.contracts.tool_contracts import OrderItemInput
         OrderItemInput(product_id="PRD-1", quantity=-5)
 
     # Dynamic role tool scoping
@@ -120,6 +123,9 @@ async def verify_phase2_contracts_and_routing():
 
 async def verify_phase3_rag_and_ingestion():
     logger.info("--> [Suite 3] Verifying Phase 3: Incremental Ingestion, Hybrid RRF & Temporal Filter...")
+    from app.rag.ingest import ingest_policies, calculate_file_sha256
+    from app.rag.retriever import search_policies
+
     async with AsyncSessionLocal() as session:
         # Ingestion test
         active_chunks = await ingest_policies(session, force_reembed=False)
@@ -143,7 +149,7 @@ async def verify_phase3_rag_and_ingestion():
         )
         assert len(results) > 0
         assert "returns_policy.md" in results[0]["source_file"].lower()
-        logger.info("Hybrid + Reranking retrieved: %s (score: %s)", results[0]["title"], results[0].get("rerank_score"))
+        logger.info("Hybrid + Reranking retrieved: %s", results[0]["title"])
 
         # Temporal boundary test
         past_date = datetime(2023, 1, 1, tzinfo=timezone.utc)
@@ -162,7 +168,7 @@ async def verify_phase3_rag_and_ingestion():
 # ─── 4. Phase 4 Verification ──────────────────────────────────────────────────
 
 async def verify_phase4_security_and_scope():
-    logger.info("--> [Suite 4] Verifying Phase 4: Security Guardrails & 5-Domain Scope...")
+    logger.info("--> [Suite 4] Verifying Phase 4: Intent-Safety Classifier & 5-Domain Scope...")
     guardrails = SecurityGuardrails()
 
     # Injection defense
@@ -175,6 +181,11 @@ async def verify_phase4_security_and_scope():
     assert res2.allowed is False
     assert res2.refusal_reason == "out_of_business_scope"
 
+    # Baseless question defense (Trivia / History / Cooking)
+    res_trivia = await guardrails.evaluate_async("What is the capital of Spain and what is the weather there?")
+    assert res_trivia.allowed is False
+    assert res_trivia.refusal_reason == "out_of_business_scope"
+
     # Allowed in-scope domain queries
     res3 = guardrails.evaluate("Can I return an opened item within 14 days?")
     assert res3.allowed is True
@@ -182,7 +193,7 @@ async def verify_phase4_security_and_scope():
     res4 = guardrails.evaluate("What is the tracking number and shipping delay policy?")
     assert res4.allowed is True
 
-    logger.info("[Suite 4 PASSED] Prompt injection and 5-domain business boundary verified.")
+    logger.info("[Suite 4 PASSED] Prompt injection, baseless question defense, and 5-domain boundary verified.")
 
 
 # ─── 5. Phase 5 Verification ──────────────────────────────────────────────────
@@ -345,6 +356,43 @@ async def verify_phase8_end_to_end_5_domains():
     logger.info("[Suite 8 PASSED] Complete 5-domain end-to-end customer support lifecycle verified.")
 
 
+# ─── 9. Admin Refund Approval & Frontend Static Serving ───────────────────────
+
+async def verify_admin_approval_and_frontend():
+    logger.info("--> [Suite 9] Verifying Admin Refund Approval & Frontend SPA...")
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # 1. Healthcheck
+        res = await client.get("/api/health")
+        assert res.status_code == 200
+        assert res.json()["status"] == "healthy"
+
+        # 2. Admin Login
+        login_res = await client.post("/api/auth/login", json={"email": "admin1@ecom.com", "password": "admin123"})
+        assert login_res.status_code == 200
+        admin_token = login_res.json()["access_token"]
+        headers = {"Authorization": f"Bearer {admin_token}"}
+
+        # 3. Check Pending Refunds
+        ref_res = await client.get("/api/admin/refunds/pending", headers=headers)
+        assert ref_res.status_code == 200
+        refunds_data = ref_res.json()["refunds"]
+
+        if refunds_data:
+            target_ref_id = refunds_data[0]["refund_id"]
+            approve_res = await client.post(f"/api/admin/refunds/{target_ref_id}/approve", headers=headers)
+            assert approve_res.status_code == 200
+            assert approve_res.json()["new_status"] == "completed"
+            logger.info("Refund approval verified: %s", target_ref_id)
+
+        # 4. Frontend index.html serving
+        html_res = await client.get("/")
+        assert html_res.status_code == 200
+        assert "ecom copilot" in html_res.text.lower() or "copilot" in html_res.text.lower()
+
+    logger.info("[Suite 9 PASSED] Admin refund approval and frontend SPA verified.")
+
+
 # ─── Master Runner ───────────────────────────────────────────────────────────
 
 async def run_master_production_suite():
@@ -361,10 +409,11 @@ async def run_master_production_suite():
     await verify_phase6_resilience_and_tickets()
     await verify_phase7_observability()
     await verify_phase8_end_to_end_5_domains()
+    await verify_admin_approval_and_frontend()
 
     total_time = time.perf_counter() - t_start
     logger.info("=================================================================")
-    logger.info("ALL 8 PHASES VERIFIED SUCCESSFULLY IN %.2f SECONDS!", total_time)
+    logger.info("ALL PHASES VERIFIED SUCCESSFULLY IN %.2f SECONDS!", total_time)
     logger.info("=================================================================")
 
 

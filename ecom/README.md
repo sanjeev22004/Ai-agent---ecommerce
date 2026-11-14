@@ -1,4 +1,4 @@
-# Production-Grade Agentic AI E-Commerce Support Resolution Copilot
+# Production-Grade Agentic AI E-Commerce Support Resolution 
 
 A production-grade, stateful AI support copilot for e-commerce, powered by PostgreSQL, FastAPI, and an Agentic ReAct orchestration loop.
 
@@ -193,12 +193,14 @@ Evaluated across 15 golden queries spanning all 5 business domains:
 - **Hybrid RRF (Dense + BM25):** 0.0305 RRF score | ~22.7ms latency (combines lexical precision with semantic recall)
 - **Hybrid + Cross-Encoder Reranking:** 3.6521 reranker score | ~45.2ms latency (top-tier semantic ranking)
 
-### Master Production Verification Suite (`test_master_suite.py`)
-Executes all 8 phase verification test suites sequentially end-to-end:
+### Master Production Verification Suite (`tests/test_suite.py`)
+Executes all 9 production verification test suites sequentially end-to-end:
 ```bash
-python ecom/test_master_suite.py
+python -m ecom.tests.test_suite
+# or
+python tests/test_suite.py
 ```
-**Results:** **ALL 8 PHASES VERIFIED SUCCESSFULLY IN 73.49s!**
+**Results:** **ALL 9 SUITES VERIFIED SUCCESSFULLY!**
 - [Suite 1 PASSED] Full Kaggle dataset scale (1.3M+ records) and customer authentication.
 - [Suite 2 PASSED] Dual-sided Pydantic v2 contracts and fast-path sub-80ms execution (66.42ms, 0 tokens).
 - [Suite 3 PASSED] Incremental ingestion (0.009s skip), Hybrid RRF, and temporal date boundary filtering.
@@ -207,26 +209,14 @@ python ecom/test_master_suite.py
 - [Suite 6 PASSED] Bounded retry with jitter and automated support ticket generation.
 - [Suite 7 PASSED] Observability, execution traces, and admin inspection endpoints.
 - [Suite 8 PASSED] Complete 5-domain end-to-end customer support lifecycle (Product Info, Shipping, Orders, Returns, Refunds).
+- [Suite 9 PASSED] Admin refund approval lifecycle, traces audit, and SPA frontend serving.
 
 ---
 
-## 12. Complete Test Execution Summary
+## 12. Test Execution Summary
 
 ```bash
-# Phase 1 Verification Test Suite (Kaggle Schema & Scale)
-python ecom/test_phase1.py
-# Result: 4/4 Tests Passed
-
-# Phase 2 Verification & Benchmark Test Suite (Contracts, Fast Path < 80ms, Scoping)
-python ecom/test_phase2.py
-# Result: 5/5 Tests Passed (Median latency: 7.57ms)
-
-# Master Production Suite (All 8 Phases End-to-End)
-python ecom/test_master_suite.py
-# Result: 8/8 Suites Passed (All 8 phases verified in 73.49s)
-
-# Original Integration Regression Suite
-python -c "import sys; sys.path.insert(0, 'ecom'); import asyncio; from test_ecom import run_tests; asyncio.run(run_tests())"
-# Result: 12/12 Tests Passed
+# Run the complete unified test suite
+python tests/test_suite.py
 ```
 

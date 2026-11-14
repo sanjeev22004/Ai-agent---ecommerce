@@ -31,7 +31,6 @@ from app.auth import hash_password
 from app.config import settings
 from app.db.models import User
 from app.db.session import AsyncSessionLocal, init_db, reset_db
-from app.rag.ingest import ingest_policies
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ecom.seed")
@@ -505,6 +504,7 @@ async def seed_database(reset: bool = False, force: bool = False) -> Dict[str, i
     # ── 10. Ingest Policy Documents ───────────────────────────────────────────
     async with AsyncSessionLocal() as session:
         logger.info("Ingesting store policy documents into vector storage...")
+        from app.rag.ingest import ingest_policies
         policy_count = await ingest_policies(session)
         report["policies"] = policy_count
 

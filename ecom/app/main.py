@@ -23,10 +23,8 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, require_admin, router as auth_router
 from app.config import settings, STATIC_DIR
 from app.db.models import ChatMessage, ChatSession, ExecutionTrace, Order, Refund, Return, User, SupportTicket
-from app.db.seed import seed_database
 from app.db.session import get_db_session, init_db
 from app.agent.orchestrator import orchestrator
-from app.rag.ingest import ingest_policies
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ecom.main")
@@ -37,6 +35,7 @@ async def lifespan(app: FastAPI):
     """Application lifecycle: initialize schema and seed on startup."""
     logger.info("Starting ecom service (Unified Python Architecture)...")
     try:
+        from app.db.seed import seed_database
         await init_db()
         await seed_database(force=False)
     except Exception as e:
@@ -102,7 +101,7 @@ async def chat(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Send message to AI copilot, run ReAct loop with guardrails, and return grounded answer."""
+    """Send message to AI , run ReAct loop with guardrails, and return grounded answer."""
     result = await orchestrator.run(
         db_session=db,
         user=current_user,
@@ -264,6 +263,7 @@ async def trigger_reembed(
     """Admin endpoint: dynamically re-chunk, re-embed, and update all policies in pgvector."""
     logger.info("Admin %s requested dynamic re-embedding of policies...", admin.email)
     try:
+        from app.rag.ingest import ingest_policies
         count = await ingest_policies(db)
         return {
             "status": "success",

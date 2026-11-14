@@ -25,7 +25,8 @@ class AsyncLangfuseClient:
     """Non-blocking, fail-open Langfuse v5 telemetry client wrapper."""
 
     def __init__(self):
-        self._init_client()
+        self._client = None
+        self._configured = False
 
     def _clean_str(self, val: Optional[str]) -> Optional[str]:
         if val is None:
@@ -33,9 +34,10 @@ class AsyncLangfuseClient:
         return val.strip("\"'")
 
     def _init_client(self):
+        self._configured = True
         raw_secret = settings.LANGFUSE_SECRET_KEY or os.getenv("LANGFUSE_SECRET_KEY")
         raw_public = settings.LANGFUSE_PUBLIC_KEY or os.getenv("LANGFUSE_PUBLIC_KEY")
-        raw_base = settings.LANGFUSE_BASE_URL or os.getenv("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
+        raw_base = settings.langfuse_host
 
         self.secret_key = self._clean_str(raw_secret)
         self.public_key = self._clean_str(raw_public)

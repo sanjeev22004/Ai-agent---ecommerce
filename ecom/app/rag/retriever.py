@@ -29,7 +29,15 @@ from app.rag.reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
 
-reranker = CrossEncoderReranker()
+_reranker: Optional[CrossEncoderReranker] = None
+
+
+def get_reranker() -> CrossEncoderReranker:
+    """Lazy initialization for CrossEncoder reranker to minimize import overhead."""
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoderReranker()
+    return _reranker
 
 
 def parse_order_date(order_date_input: Union[str, datetime]) -> Optional[datetime]:
@@ -173,7 +181,7 @@ async def search_policies(
 
     # 5. Cross-Encoder Reranking -> Top-K
     if use_reranker:
-        final_results = reranker.rerank(query, top_candidates, top_k=top_k)
+        final_results = get_reranker().rerank(query, top_candidates, top_k=top_k)
     else:
         final_results = top_candidates[:top_k]
 

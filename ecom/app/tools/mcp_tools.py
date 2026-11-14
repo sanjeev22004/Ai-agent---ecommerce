@@ -49,8 +49,6 @@ from app.contracts.tool_contracts import (
     InspectTracesOutput,
 )
 from app.db.models import Order, OrderItem, Product, Return, Refund, User, ExecutionTrace
-from app.rag.retriever import search_policies
-from app.rag.ingest import ingest_policies
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +504,8 @@ async def tool_policy_search(
     params: PolicySearchInput,
 ) -> Dict[str, Any]:
     """Execute pgvector semantic search over store policies with active date filtering."""
+    from app.rag.retriever import search_policies
+
     results = await search_policies(
         session=session,
         query=params.query,
@@ -592,6 +592,8 @@ async def tool_reembed_policies(
     params: ReembedPoliciesInput,
 ) -> Dict[str, Any]:
     """Admin tool: Trigger policy re-embedding."""
+    from app.rag.ingest import ingest_policies
+
     count = await ingest_policies(session)
     raw_success = {
         "success": True,

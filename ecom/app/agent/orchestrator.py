@@ -34,7 +34,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import ChatMessage, ChatSession, ExecutionTrace, User
 from app.tools.mcp_tools import execute_tool
-from app.rag.retriever import retrieve_policies
 from app.router.intent_router import (
     DeterministicIntentRouter,
     RouteTarget,
@@ -90,14 +89,21 @@ def normalize_tool_arguments(tool_name: str, raw_args: Dict[str, Any]) -> Dict[s
 
 class AgentOrchestrator:
     def __init__(self):
-        self.client = AsyncOpenAI(
-            base_url=settings.LLM_BASE_URL,
-            api_key=settings.LLM_API_KEY,
-            timeout=httpx.Timeout(5.0, connect=2.0),
-        )
+        self._client: Optional[AsyncOpenAI] = None
         self.model_name = settings.LLM_MODEL
         self.router = DeterministicIntentRouter()
         self.guardrails = SecurityGuardrails()
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Lazy-load the AsyncOpenAI client within the active event loop."""
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                base_url=settings.LLM_BASE_URL,
+                api_key=settings.LLM_API_KEY,
+                timeout=httpx.Timeout(settings.LLM_TIMEOUT, connect=5.0),
+            )
+        return self._client
 
     async def get_or_create_session(
         self,
@@ -155,7 +161,7 @@ class AgentOrchestrator:
         )
 
         # ── 1. Security & Business Scope Guardrails ───────────────────────────
-        guardrail_eval = self.guardrails.evaluate(user_message)
+        guardrail_eval = await self.guardrails.evaluate_async(user_message)
         if not guardrail_eval.allowed:
             step = trace.start_step(
                 "security_guardrail",
@@ -403,6 +409,7 @@ class AgentOrchestrator:
                 logger.warning("LLM API call unavailable or timed out (%s). Activating local RAG degradation...", e)
                 llm_step.finish(output={"error": str(e)}, is_error=True)
                 try:
+                    from app.rag.retriever import retrieve_policies
                     policy_matches = await retrieve_policies(db_session, user_message, top_k=2)
                     if policy_matches:
                         top_p = policy_matches[0]
@@ -412,18 +419,17 @@ class AgentOrchestrator:
                             f"*(Retrieved via Offline Hybrid RAG from `{top_p.get('source_file')}`)*"
                         )
                     else:
-                        ticket = await create_support_ticket(
-                            db_session,
-                            customer_id=getattr(user, "customer_id", None) or user.id,
-                            customer_email=user.email,
-                            issue_description=f"AI reasoning outage on user query: {user_message}",
-                            failed_tool="llm_reasoning",
-                            priority="medium",
+                        ticket_id = await create_support_ticket(
+                            session=db_session,
+                            user=user,
+                            tool_name="llm_reasoning",
+                            failure_category="ai_reasoning_outage",
+                            request_summary=f"AI reasoning outage on user query: {user_message[:200]}",
+                            diagnostic_context={"error": str(e)},
                         )
                         final_text = build_degraded_response(
-                            ticket_id=ticket.id,
-                            user_message=user_message,
-                            failure_reason="Temporary reasoning service connectivity limit",
+                            ticket_id=ticket_id,
+                            tool_name="llm_reasoning",
                         )
                 except Exception as fallback_err:
                     logger.exception("Fallback degradation failed: %s", fallback_err)
